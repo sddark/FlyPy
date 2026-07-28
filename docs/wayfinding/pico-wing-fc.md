@@ -1,0 +1,61 @@
+# Map: Pico W Fixed-Wing Flight Controller
+
+## Destination
+
+A complete spec for a MicroPython flight controller on the Raspberry Pi Pico W for a V-tail fixed-wing drone: system inputs and outputs, protocols, and per-part definitions precise enough that each part can be developed independently and then assembled. The map is done when that spec exists — building and flying are beyond it.
+
+## Notes
+
+- **Domain:** hobby fixed-wing FC; MicroPython on Pico W (RP2040). Timing precision requirements are relaxed (fixed-wing loop rates), per the owner.
+- **Hardware (fixed):** Raspberry Pi Pico W · MPU6050 (I²C) · BZGNSS BZ-251 GPS (u-blox M10, UART/UBX) · ELRS receiver (CRSF, UART) · one ESC with BEC on Oneshot125 · 2 V-tail servos (digital, standard PWM) · power via ESC BEC, no battery voltage sensing.
+- **Decided during charting** (owner grilling, recorded here as standing constraints):
+  - Platform: **MicroPython**.
+  - Modes: **manual**, **stabilized**, **autonomous** (waypoint navigation via GPS); mode select via TX channel.
+  - **V-tail only** mixer config.
+  - WiFi: Pico W **hosts its own AP**, **only while disarmed**; simplest-possible interface (HTML forms).
+  - **All** parameters configurable via the web server: PIDs, rates, mixing, failsafe, modes.
+  - Failsafe: RC link lost → level wings + cut throttle; GPS lost in autonomous → same (level out, cut throttle).
+  - Arming: **TX switch channel**; only pre-arm check is **zero throttle**.
+- **Skills:** use `/domain-modeling` for terminology (modes, mixer, failsafe); `/grilling` for HITL parts; `/research` subagents for research parts.
+
+## Parts
+
+```mermaid
+flowchart LR
+    r1["Research: MicroPython platform feasibility"] --> pinmap["Pin map & power architecture"]
+    r1 --> control["Control system design"]
+    r1 --> webcfg["Web config & parameter persistence"]
+    r2["Research: CRSF protocol under MicroPython"] --> telem["Telemetry content spec"]
+    r2 --> modes["Flight modes, arming & failsafe"]
+    r3["Research: BZ-251 UBX configuration"] --> nav["Autonomous navigation design"]
+    r4["Research: MPU6050 attitude estimation"] --> control
+    spec["Spec structure & format"]
+    control --> nav
+    click r1 "./pico-wing-fc/research-micropython-platform.md"
+    click r2 "./pico-wing-fc/research-crsf-protocol.md"
+    click r3 "./pico-wing-fc/research-bz251-ubx.md"
+    click r4 "./pico-wing-fc/research-mpu6050-attitude.md"
+    click spec "./pico-wing-fc/spec-structure.md"
+    click pinmap "./pico-wing-fc/pin-map-power.md"
+    click control "./pico-wing-fc/control-system-design.md"
+    click modes "./pico-wing-fc/flight-modes-arming-failsafe.md"
+    click webcfg "./pico-wing-fc/web-config-persistence.md"
+    click telem "./pico-wing-fc/telemetry-content.md"
+    click nav "./pico-wing-fc/autonomous-navigation.md"
+```
+
+## Decisions so far
+
+<!-- one line per resolved part: gist + link -->
+
+## Not yet specified
+
+- **Waypoint mission entry:** how missions get into the FC (web UI while disarmed? pre-cooked file? live over CRSF?) — depends on both the web-config and navigation parts.
+- **Heading reference without a magnetometer:** GPS course-over-ground only works while moving; behavior at low speed / on the ground is undefined.
+- **Altitude reference:** GPS altitude only (no baro) — whether that's good enough for navigation, or a barometer joins the hardware list.
+
+## Out of scope
+
+- Building, flashing, bench-testing, and flying the firmware — the destination is the spec.
+- Quad/multirotor configurations; the mixer spec covers V-tail only.
+- Battery voltage / current sensing (no ADC divider in the build).
