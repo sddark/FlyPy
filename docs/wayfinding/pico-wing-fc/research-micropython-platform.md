@@ -4,7 +4,7 @@ Type: research (AFK)
 
 ## Status
 
-open
+resolved 2026-07-28
 
 ## Question
 
@@ -17,3 +17,5 @@ What can MicroPython on the Pico W actually deliver for this FC, and with which 
 - Fixed-wing loop rates of 50–100 Hz are the target, per owner.
 
 ## Decision
+
+Feasible, no blockers. Single-core asyncio architecture; WiFi/web (microdot) only while disarmed; Oneshot125 via PWM-slice one-shot trick, 50 Hz servo PWM; JSON config in flash with tmp+rename safe writes; 2 UARTs + I²C fit with zero contention. Only bench risk: Oneshot125 pulse generation. Full findings: [docs/research/micropython-platform.md](../../research/micropython-platform.md)

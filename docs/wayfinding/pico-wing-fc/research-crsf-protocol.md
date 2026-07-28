@@ -4,7 +4,7 @@ Type: research (AFK)
 
 ## Status
 
-open
+resolved 2026-07-28
 
 ## Question
 
@@ -16,3 +16,5 @@ What does implementing CRSF (TBS Crossfire / ELRS) on a Pico W UART in MicroPyth
 - Channel count needed: ≥6 (4 controls + arm switch + mode switch).
 
 ## Decision
+
+420 000 baud, `[addr][len][type][payload][crc8]` frames; channels = type 0x16, 16×11-bit little-endian packed (trivial pure-Python unpack). Telemetry 0x02/0x1E/0x21 documented with byte layouts; battery frame omitted (no sensing). Link loss = timeout on 0x16 frames (ELRS default "no pulses" failsafe). Reference impls: AlfredoCRSF (MIT), crsf-wg wiki. Full findings: [docs/research/crsf-protocol.md](../../research/crsf-protocol.md)

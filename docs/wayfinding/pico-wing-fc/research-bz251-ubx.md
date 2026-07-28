@@ -4,7 +4,7 @@ Type: research (AFK)
 
 ## Status
 
-open
+resolved 2026-07-28
 
 ## Question
 
@@ -16,3 +16,5 @@ What does the spec need to say about driving the BZGNSS BZ-251 (u-blox M10) from
 - No magnetometer — course-over-ground is the only heading source (noted on the map's fog list).
 
 ## Decision
+
+M10 configured via UBX-CFG-VALSET (RAM layer, every boot): 5 Hz nav rate, airborne <4g dynamic model, NAV-PVT on, all NMEA off. Default baud 115 200. NAV-PVT field map documented; bespoke ~100-line driver recommended over porting a library. TTFF ~27 s cold. Full findings: [docs/research/bz251-ubx.md](../../research/bz251-ubx.md)

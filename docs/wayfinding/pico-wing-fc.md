@@ -22,13 +22,13 @@ A complete spec for a MicroPython flight controller on the Raspberry Pi Pico W f
 
 ```mermaid
 flowchart LR
-    r1["Research: MicroPython platform feasibility"] --> pinmap["Pin map & power architecture"]
+    r1(["Decided: MicroPython platform feasibility"]) --> pinmap["Pin map & power architecture"]
     r1 --> control["Control system design"]
     r1 --> webcfg["Web config & parameter persistence"]
-    r2["Research: CRSF protocol under MicroPython"] --> telem["Telemetry content spec"]
+    r2(["Decided: CRSF protocol under MicroPython"]) --> telem["Telemetry content spec"]
     r2 --> modes["Flight modes, arming & failsafe"]
-    r3["Research: BZ-251 UBX configuration"] --> nav["Autonomous navigation design"]
-    r4["Research: MPU6050 attitude estimation"] --> control
+    r3(["Decided: BZ-251 UBX configuration"]) --> nav["Autonomous navigation design"]
+    r4(["Decided: MPU6050 attitude estimation"]) --> control
     spec["Spec structure & format"]
     control --> nav
     click r1 "./pico-wing-fc/research-micropython-platform.md"
@@ -46,7 +46,10 @@ flowchart LR
 
 ## Decisions so far
 
-<!-- one line per resolved part: gist + link -->
+- [Research: MicroPython platform feasibility](./pico-wing-fc/research-micropython-platform.md) — feasible, no blockers; single-core asyncio, microdot web while disarmed, PWM-slice Oneshot125.
+- [Research: CRSF protocol under MicroPython](./pico-wing-fc/research-crsf-protocol.md) — frame formats + telemetry layouts documented; link loss = 0x16 frame timeout.
+- [Research: BZ-251 UBX configuration](./pico-wing-fc/research-bz251-ubx.md) — CFG-VALSET boot sequence defined (5 Hz, airborne <4g, NAV-PVT only); bespoke driver.
+- [Research: MPU6050 attitude estimation](./pico-wing-fc/research-mpu6050-attitude.md) — Mahony @ 200 Hz, DLPF 98 Hz, raw driver, no magnetometer yaw.
 
 ## Not yet specified
 

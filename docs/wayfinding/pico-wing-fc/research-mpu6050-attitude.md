@@ -4,7 +4,7 @@ Type: research (AFK)
 
 ## Status
 
-open
+resolved 2026-07-28
 
 ## Question
 
@@ -16,3 +16,5 @@ What attitude-estimation approach should the spec choose for the MPU6050 on Micr
 - Control loop target 50–100 Hz.
 
 ## Decision
+
+Recommended: **Mahony** quaternion estimator at 200 Hz (cheaper than Madgwick, estimates gyro bias in flight), raw I²C driver (no DMP), DLPF 98 Hz start with 42 Hz fallback, gyro zeroed each boot, accel calibration via web config. Yaw drifts without magnetometer — pitch/roll from IMU, heading from GPS course. Full findings: [docs/research/mpu6050-attitude.md](../../research/mpu6050-attitude.md)
