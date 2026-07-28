@@ -12,6 +12,7 @@ Define the autonomous mode: waypoint representation, how the nav loop turns GPS 
 
 ## Assumptions
 
+- **Transpile from INAV**: nav logic ports from INAV `src/main/navigation/` (waypoint execution, guidance, GPS-loss) — per owner directive.
 - BZ-251 provides position/velocity/course; no magnetometer, no baro.
 - Mission entry method is fog (see map "Not yet specified") — this part may graduate it.
 

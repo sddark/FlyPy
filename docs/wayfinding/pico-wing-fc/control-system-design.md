@@ -12,6 +12,7 @@ Define the control core of the spec: loop rate(s), PID structure for pitch/roll 
 
 ## Assumptions
 
+- **Transpile from INAV**: loops and V-tail mixer port from INAV `flight/pid.c` + `mixer.c` (per owner directive); this part becomes "adapt INAV's fixed-wing controller" not "design a controller".
 - Modes are manual / stabilized / autonomous (autonomous feeds its own demands into these loops).
 - V-tail only; no rudder channel, no coordinated-turn logic.
 - All loop parameters are web-configurable, per owner.

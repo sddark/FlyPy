@@ -16,6 +16,7 @@ A complete spec for a MicroPython flight controller on the Raspberry Pi Pico W f
   - **All** parameters configurable via the web server: PIDs, rates, mixing, failsafe, modes.
   - Failsafe: RC link lost → level wings + cut throttle; GPS lost in autonomous → same (level out, cut throttle).
   - Arming: **TX switch channel**; only pre-arm check is **zero throttle**.
+  - **Implementation strategy: transpile from INAV.** INAV (C, fixed-wing-focused FC firmware) is the reference base — control loops, mixer, navigation, and protocol handling are ported module-by-module from INAV's source to MicroPython, rather than designed from scratch. This grounds every algorithm in proven code and reduces hallucination. Where INAV and these notes disagree (e.g. estimator choice), INAV's approach is the default and deviations must be justified in the part's Decision.
 - **Skills:** use `/domain-modeling` for terminology (modes, mixer, failsafe); `/grilling` for HITL parts; `/research` subagents for research parts.
 
 ## Parts
@@ -30,6 +31,9 @@ flowchart LR
     r3(["Decided: BZ-251 UBX configuration"]) --> nav["Autonomous navigation design"]
     r4(["Decided: MPU6050 attitude estimation"]) --> control
     spec["Spec structure & format"]
+    inav["Research: INAV transpile survey"] --> control
+    inav --> nav
+    inav --> modes
     control --> nav
     click r1 "./pico-wing-fc/research-micropython-platform.md"
     click r2 "./pico-wing-fc/research-crsf-protocol.md"
@@ -42,6 +46,7 @@ flowchart LR
     click webcfg "./pico-wing-fc/web-config-persistence.md"
     click telem "./pico-wing-fc/telemetry-content.md"
     click nav "./pico-wing-fc/autonomous-navigation.md"
+    click inav "./pico-wing-fc/research-inav-survey.md"
 ```
 
 ## Decisions so far
@@ -50,7 +55,6 @@ flowchart LR
 - [Research: CRSF protocol under MicroPython](./pico-wing-fc/research-crsf-protocol.md) — frame formats + telemetry layouts documented; link loss = 0x16 frame timeout.
 - [Research: BZ-251 UBX configuration](./pico-wing-fc/research-bz251-ubx.md) — CFG-VALSET boot sequence defined (5 Hz, airborne <4g, NAV-PVT only); bespoke driver.
 - [Research: MPU6050 attitude estimation](./pico-wing-fc/research-mpu6050-attitude.md) — Mahony @ 200 Hz, DLPF 98 Hz, raw driver, no magnetometer yaw.
-
 ## Not yet specified
 
 - **Waypoint mission entry:** how missions get into the FC (web UI while disarmed? pre-cooked file? live over CRSF?) — depends on both the web-config and navigation parts.
