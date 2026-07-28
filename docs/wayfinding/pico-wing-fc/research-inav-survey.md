@@ -40,6 +40,50 @@ Verified against INAV `master` (fixed-wing relevant files only; line counts are 
 - **Telemetry content spec:** which frames/fields to send is a bespoke decision (INAV sends everything); encoding ported from `telemetry/crsf.c`.
 - **Mission entry:** fog item — INAV's MSP mission upload is out of scope (no configurator), so entry is bespoke (web UI / file).
 
+### System diagram (transpile vs bespoke)
+
+Candidate for the system-level block diagram the "Spec structure & format" part asks for:
+
+```mermaid
+flowchart LR
+    subgraph inputs[Inputs]
+        crsf_rx["CRSF RX decode<br/>(transpiled: rx/crsf.c)"]
+        gps_drv["BZ-251 UBX driver<br/>(bespoke)"]
+        imu_drv["MPU6050 I²C driver<br/>(bespoke)"]
+    end
+
+    subgraph core[Flight core — asyncio scheduler (bespoke)]
+        imu["Attitude estimation<br/>(transpiled: flight/imu.c)"]
+        pid["Fixed-wing PID<br/>(transpiled: flight/pid.c)"]
+        mixer["V-tail mixer<br/>(transpiled: flight/mixer.c)"]
+        nav["Waypoint nav / guidance<br/>(transpiled: navigation/ fixed-wing subset)"]
+        modes["Arming, modes & failsafe<br/>(transpiled: fc_core.c, rc_modes.c, failsafe.c)"]
+    end
+
+    subgraph outputs[Outputs]
+        pwm["Servo/ESC PWM + Oneshot125<br/>(bespoke)"]
+        telem["CRSF telemetry encoders<br/>(transpiled: telemetry/crsf.c;<br/>content bespoke)"]
+    end
+
+    subgraph ground[Ground — disarmed only]
+        webcfg["Web config + flash persistence<br/>(bespoke)"]
+        mission["Mission entry<br/>(bespoke — fog item)"]
+    end
+
+    crsf_rx --> modes
+    crsf_rx --> pid
+    imu_drv --> imu
+    gps_drv --> nav
+    imu --> pid
+    nav --> pid
+    modes --> pid
+    modes --> nav
+    pid --> mixer --> pwm
+    nav --> telem
+    webcfg -.configures.-> core
+    mission -.loads waypoints.-> nav
+```
+
 ### License
 
 INAV is **GPL-3.0** (`LICENSE`, repo-reported SPDX GPL-3.0). A transpiled derivative is a derivative work: the MicroPython firmware must be GPLv3, with source available. Record this in the spec; it also means all ported files keep attribution headers.

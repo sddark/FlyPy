@@ -14,5 +14,6 @@ How is the destination spec itself organized? Decide: the document layout (one b
 
 - The spec's audience is the owner building each part independently, then assembling — per the destination.
 - Spec lives in this repo as Markdown (mermaid diagrams allowed), alongside this map.
+- A candidate system-level block diagram (transpiled vs bespoke modules, in mermaid) already exists in the Decision of "Research: INAV transpile survey" — adopt or refine it here rather than starting from blank.
 
 ## Decision
