@@ -88,4 +88,6 @@ flowchart LR
 
 INAV is **GPL-3.0** (`LICENSE`, repo-reported SPDX GPL-3.0). A transpiled derivative is a derivative work: the MicroPython firmware must be GPLv3, with source available. Record this in the spec; it also means all ported files keep attribution headers.
 
+Assets: [System diagrams](./system-diagrams.md) — hierarchical mermaid documentation of the whole system, transpiled vs bespoke annotated per block.
+
 Confirmed the assumption in "Research: MPU6050 attitude estimation": INAV's `imu.c` uses a Mahony-family estimator for gyro+accel without mag — the two research parts agree, no deviation to justify.
