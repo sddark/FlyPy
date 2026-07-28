@@ -12,7 +12,8 @@ Define the control core of the spec: loop rate(s), PID structure for pitch/roll 
 
 ## Assumptions
 
-- **Transpile from INAV**: loops and V-tail mixer port from INAV `flight/pid.c` + `mixer.c` (per owner directive); this part becomes "adapt INAV's fixed-wing controller" not "design a controller".
+- **Transpile from INAV** (surveyed, see "Research: INAV transpile survey"): fixed-wing PID from `flight/pid.c` (~1510 lines, port fixed-wing path only), V-tail mixer from `flight/mixer.c` (~739 lines, V-tail table row only), attitude estimator from `flight/imu.c` (~986 lines, Mahony-family — matches the MPU6050 research part). This part becomes "adapt INAV's fixed-wing controller" not "design a controller".
+- **Bespoke:** MicroPython MPU6050 driver and servo/ESC PWM/Oneshot125 output have no INAV counterpart.
 - Modes are manual / stabilized / autonomous (autonomous feeds its own demands into these loops).
 - V-tail only; no rudder channel, no coordinated-turn logic.
 - All loop parameters are web-configurable, per owner.

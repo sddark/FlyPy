@@ -12,7 +12,7 @@ Turn the owner's decided behavior into a precise state-machine spec: armed/disar
 
 ## Assumptions
 
-- **Transpile from INAV**: arming/failsafe state machine references INAV `fc_core.c`/`failsafe.c`, simplified to this build's three modes — per owner directive.
+- **Transpile from INAV** (surveyed, see "Research: INAV transpile survey"): arming/runtime state from `fc/fc_core.c` + `fc/runtime_config.c`, mode-activation channel ranges from `fc/rc_modes.c`, failsafe detection/procedure structure from `flight/failsafe.c` (~633 lines) — all simplified to this build's three modes and level+cut-throttle procedures.
 - Owner's decisions (map Notes) are fixed: TX-switch arming, zero-throttle only pre-arm, level+cut-throttle on both RC and GPS loss.
 - WiFi config only while disarmed — the state machine must encode that.
 

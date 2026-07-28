@@ -31,7 +31,7 @@ flowchart LR
     r3(["Decided: BZ-251 UBX configuration"]) --> nav["Autonomous navigation design"]
     r4(["Decided: MPU6050 attitude estimation"]) --> control
     spec["Spec structure & format"]
-    inav["Research: INAV transpile survey"] --> control
+    inav(["Decided: INAV transpile survey"]) --> control
     inav --> nav
     inav --> modes
     control --> nav
@@ -55,6 +55,7 @@ flowchart LR
 - [Research: CRSF protocol under MicroPython](./pico-wing-fc/research-crsf-protocol.md) — frame formats + telemetry layouts documented; link loss = 0x16 frame timeout.
 - [Research: BZ-251 UBX configuration](./pico-wing-fc/research-bz251-ubx.md) — CFG-VALSET boot sequence defined (5 Hz, airborne <4g, NAV-PVT only); bespoke driver.
 - [Research: MPU6050 attitude estimation](./pico-wing-fc/research-mpu6050-attitude.md) — Mahony @ 200 Hz, DLPF 98 Hz, raw driver, no magnetometer yaw.
+- [Research: INAV transpile survey](./pico-wing-fc/research-inav-survey.md) — transpile pid.c/mixer.c/imu.c, navigation fixed-wing subset, fc_core/rc_modes/failsafe, crsf rx+telemetry encoders; bespoke drivers, web config/persistence, scheduler, telemetry content, mission entry; GPLv3 applies.
 ## Not yet specified
 
 - **Waypoint mission entry:** how missions get into the FC (web UI while disarmed? pre-cooked file? live over CRSF?) — depends on both the web-config and navigation parts.

@@ -14,5 +14,6 @@ Define the configuration part of the spec: the AP-mode network behavior (SSID, s
 
 - Pico W hosts its own AP, WiFi only while disarmed, simplest interface (owner's words: "whatever is easiest").
 - All parameters — PIDs, rates, mixing, failsafe, modes — are configurable here.
+- **Bespoke** (per "Research: INAV transpile survey"): nothing ports from INAV — its CLI/MSP/EEPROM config is desktop-oriented. Web server (microdot), JSON-to-flash persistence, and validation are built fresh.
 
 ## Decision

@@ -14,5 +14,6 @@ Decide exactly which CRSF telemetry the FC sends to the TX: which frames (GPS po
 
 - No battery voltage sensing exists, so battery telemetry is either absent or stubbed.
 - Telemetry is nice-to-have relative to control; it must never starve the control loop.
+- **Bespoke content, transpiled encoding** (per "Research: INAV transpile survey"): the frame/field selection is decided here fresh (INAV sends everything); the frame encoders port from INAV `telemetry/crsf.c` (~830 lines).
 
 ## Decision

@@ -4,7 +4,7 @@ Type: research (AFK)
 
 ## Status
 
-open
+resolved 2026-08-04
 
 ## Question
 
@@ -16,3 +16,32 @@ Which INAV modules should this project transpile to MicroPython, and what does e
 - Target INAV: latest stable release branch, fixed-wing platform only; multirotor-specific code ignored.
 
 ## Decision
+
+Verified against INAV `master` (fixed-wing relevant files only; line counts are whole-file, ported subset is smaller).
+
+### Transpile from INAV (port module-by-module)
+
+| Module | INAV source (all under `src/main/`) | Size | Porting difficulty |
+|---|---|---|---|
+| Fixed-wing PID controller | `flight/pid.c` | ~1510 lines | Medium — port the fixed-wing PIFF/PID path only; drop multirotor, anti-windup extras as needed |
+| V-tail mixer | `flight/mixer.c` | ~739 lines | Easy — mixer table + `mixTable()` math; V-tail row only |
+| Attitude estimation (gyro+accel) | `flight/imu.c` | ~986 lines | Medium — Mahony-style complementary filter; confirms the Mahony recommendation from "Research: MPU6050 attitude estimation" |
+| Navigation core (WP execution, guidance, GPS-loss) | `navigation/navigation.c` (~5466 lines), `navigation/navigation_fixedwing.c` (~939), `navigation_geo.c`, `sqrt_controller.c` | Large | Hard — port the fixed-wing waypoint/RTH subset only; skip pos_estimator AGL/flow/geozone/launch |
+| Arming / runtime state | `fc/fc_core.c`, `fc/runtime_config.c`, `fc/rc_modes.c` | ~1100 lines | Medium — port the arming-state and mode-activation logic, simplified to 3 modes |
+| Failsafe state machine | `flight/failsafe.c` | ~633 lines | Medium — port detection/procedure structure; procedures simplified to level+cut-throttle |
+| CRSF RX frame handling | `rx/crsf.c` | ~368 lines | Easy — frame decode maps directly onto the layouts in "Research: CRSF protocol" |
+| CRSF telemetry encoding | `telemetry/crsf.c` | ~830 lines | Easy — port frame encoders only; content selection is bespoke (see below) |
+
+### Bespoke (no INAV counterpart — build fresh)
+
+- **MicroPython hardware drivers:** MPU6050 (I²C), BZ-251 UBX (research part already recommends a bespoke ~100-line driver), servo/ESC PWM + Oneshot125 output on RP2040 slices.
+- **Web config + persistence:** Pico W AP, microdot HTML forms, JSON-to-flash parameter store. INAV's equivalents (CLI/MSP/EEPROM) are desktop-oriented; nothing to port.
+- **Scheduler/runtime:** asyncio loop replacing INAV's `fc_tasks.c` scheduler; only the task-rate *budget* is borrowed.
+- **Telemetry content spec:** which frames/fields to send is a bespoke decision (INAV sends everything); encoding ported from `telemetry/crsf.c`.
+- **Mission entry:** fog item — INAV's MSP mission upload is out of scope (no configurator), so entry is bespoke (web UI / file).
+
+### License
+
+INAV is **GPL-3.0** (`LICENSE`, repo-reported SPDX GPL-3.0). A transpiled derivative is a derivative work: the MicroPython firmware must be GPLv3, with source available. Record this in the spec; it also means all ported files keep attribution headers.
+
+Confirmed the assumption in "Research: MPU6050 attitude estimation": INAV's `imu.c` uses a Mahony-family estimator for gyro+accel without mag — the two research parts agree, no deviation to justify.
