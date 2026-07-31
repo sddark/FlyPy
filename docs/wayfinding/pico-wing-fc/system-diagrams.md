@@ -4,6 +4,8 @@ Hierarchical mermaid documentation of the Pico W fixed-wing FC, from system cont
 
 Source legend: **[INAV]** = transpiled from INAV (see [Research: INAV transpile survey](./research-inav-survey.md)) · **[bespoke]** = built fresh.
 
+Terminal rendering: `scripts/diagram docs/wayfinding/pico-wing-fc/system-diagrams.md [n]` (use `--list` for block numbers).
+
 ---
 
 ## L0 — System context

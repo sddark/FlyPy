@@ -4,7 +4,7 @@ Type: grilling (HITL)
 
 ## Status
 
-open
+deferred (post-MVP)
 
 ## Question
 
@@ -17,3 +17,5 @@ Decide exactly which CRSF telemetry the FC sends to the TX: which frames (GPS po
 - **Bespoke content, transpiled encoding** (per "Research: INAV transpile survey"): the frame/field selection is decided here fresh (INAV sends everything); the frame encoders port from INAV `telemetry/crsf.c` (~830 lines).
 
 ## Decision
+
+Deferred: owner confirmed the MVP does not need CRSF telemetry (FC→TX) — RX (channels in) only. This part stays open/unresolved but off the MVP critical path; revisit once the MVP (manual/stabilized control, no nav) is flying. The CRSF RX-only prototype in `firmware/rc.py` reflects this — it decodes 0x16 channel frames but sends nothing back up the link.

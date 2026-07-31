@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Compile the firmware to .mpy and copy it to a Pico running MicroPython.
+#
+#   scripts/deploy                 # compile everything, deploy, reset
+#   scripts/deploy mission nav     # compile and deploy only those modules
+#   scripts/deploy --source        # skip mpy-cross, push the .py sources
+#   scripts/deploy --port COM3     # override the serial port
+#
+# Requires: pip install mpremote mpy-cross
+#
+# The Pico's RP2040 is a Cortex-M0+, hence -march=armv6m. Compiled .mpy
+# files skip the on-device compile at import, which matters on a 264 KB
+# part -- server.py's page strings are the big win. lib/ (microdot) always
+# goes across as source; it is small and rarely changes.
+#
+# config.json and mission.json live on the device's flash and survive this.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+MARCH=armv6m
+PORT=${MPREMOTE_PORT:-/dev/ttyACM0}
+BUILD_DIR=build
+COMPILE=1
+MODULES=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --source) COMPILE=0 ;;
+        --port) PORT=$2; shift ;;
+        -*) echo "unknown option: $1" >&2; exit 1 ;;
+        *) MODULES+=("$1") ;;
+    esac
+    shift
+done
+
+if [ ${#MODULES[@]} -eq 0 ]; then
+    while IFS= read -r path; do
+        MODULES+=("$(basename "$path" .py)")
+    done < <(find firmware -maxdepth 1 -name '*.py')
+fi
+
+push() {
+    echo "-> $2"
+    mpremote connect "$PORT" fs cp "$1" ":$2"
+}
+
+if [ "$COMPILE" -eq 1 ]; then
+    mkdir -p "$BUILD_DIR"
+    for module in "${MODULES[@]}"; do
+        mpy-cross -march="$MARCH" -O2 \
+            "firmware/$module.py" -o "$BUILD_DIR/$module.mpy"
+        push "$BUILD_DIR/$module.mpy" "$module.mpy"
+    done
+else
+    for module in "${MODULES[@]}"; do
+        push "firmware/$module.py" "$module.py"
+    done
+fi
+
+mpremote connect "$PORT" fs cp -r firmware/lib :
+mpremote connect "$PORT" reset
+echo "Deployed ${#MODULES[@]} module(s) plus lib/; device reset."

@@ -1,0 +1,225 @@
+#!/usr/bin/env node
+// Render the mermaid diagrams in this repo's docs as ASCII in the terminal.
+//
+//   scripts/diagram                      # render the map's parts diagram
+//   scripts/diagram <file.md>            # render every mermaid block in a file
+//   scripts/diagram <file.md> <n>        # render only the nth block (1-based)
+//   scripts/diagram --list <file.md>     # list the blocks in a file
+//   scripts/diagram --web [file.md]      # render in the browser (real mermaid.js)
+//
+// Options: --ids (node IDs instead of labels) · --ascii (no unicode box chars)
+//          --max <n> (truncate node labels, default 48, 0 = off) · --raw (no preprocessing)
+//
+// Rendering is done by the `mermaid-ascii` npm package (fetched via npx on
+// first use). It only understands a small mermaid subset, so this script
+// rewrites the docs' diagrams into that subset first: node shapes/quotes are
+// resolved to their label text, subgraphs are flattened, every arrow variant
+// becomes `-->` (edge text kept as `-->|text|`), `&` fan-outs are expanded,
+// and stateDiagram-v2 is converted to a plain graph.
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { spawnSync } = require("child_process");
+
+const DEFAULT_FILE = path.join(__dirname, "..", "docs", "wayfinding", "pico-wing-fc.md");
+
+// ---------- args ----------
+const argv = process.argv.slice(2);
+const opts = { list: false, ids: false, ascii: false, raw: false, web: false, max: 48 };
+const positional = [];
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === "--list") opts.list = true;
+  else if (a === "--web") opts.web = true;
+  else if (a === "--ids") opts.ids = true;
+  else if (a === "--ascii") opts.ascii = true;
+  else if (a === "--raw") opts.raw = true;
+  else if (a === "--max") opts.max = parseInt(argv[++i], 10);
+  else if (a === "-h" || a === "--help") {
+    const header = [];
+    for (const l of fs.readFileSync(__filename, "utf8").split("\n").slice(1)) {
+      if (!l.startsWith("//")) break;
+      header.push(l.replace(/^\/\/ ?/, ""));
+    }
+    console.log(header.join("\n"));
+    process.exit(0);
+  } else positional.push(a);
+}
+const file = positional[0] || DEFAULT_FILE;
+const only = positional[1] ? parseInt(positional[1], 10) : null;
+
+// ---------- extract mermaid blocks (with nearest preceding heading) ----------
+function extractBlocks(text, isMmd) {
+  if (isMmd) return [{ title: null, code: text }];
+  const blocks = [];
+  let heading = null, inBlock = false, buf = [];
+  for (const line of text.split("\n")) {
+    if (inBlock) {
+      if (/^```/.test(line)) { blocks.push({ title: heading, code: buf.join("\n") }); buf = []; inBlock = false; }
+      else buf.push(line);
+    } else if (/^```mermaid/.test(line.trim())) inBlock = true;
+    else if (/^#{1,6}\s/.test(line)) heading = line.replace(/^#{1,6}\s+/, "").trim();
+  }
+  return blocks;
+}
+
+// ---------- preprocessing ----------
+const clean = (s, max) => {
+  // mermaid-ascii splits node text on `&`, so it can't appear in labels
+  let t = s.replace(/<br\s*\/?>/gi, " · ").replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&/g, "+").replace(/\s+/g, " ").trim();
+  if (max > 0 && t.length > max) t = t.slice(0, max - 1) + "…";
+  return t;
+};
+
+function preprocess(code, { ids, max }) {
+  const lines = code.split("\n").map(l => l.trim()).filter(Boolean);
+  const header = lines.shift() || "graph LR";
+  const isState = /^stateDiagram/.test(header);
+  const dirMatch = header.match(/\b(LR|RL|TB|TD|BT)\b/);
+  const dir = isState ? "TD" : (dirMatch ? dirMatch[1] : "LR");
+
+  const labels = {};   // id -> label text
+  const edges = [];    // { from, to, label }
+  const standalone = new Set();
+
+  const name = id => {
+    if (ids || !labels[id]) return id;
+    return clean(labels[id], max);
+  };
+
+  for (let line of lines) {
+    if (isState) {
+      if (/^(\[\*\]|[A-Za-z0-9_]+)\s*-->/.test(line)) {
+        const m = line.match(/^(.+?)\s*-->\s*(.+?)\s*(?::\s*(.*))?$/);
+        if (!m) continue;
+        const from = m[1] === "[*]" ? "START" : m[1];
+        const to = m[2] === "[*]" ? "END" : m[2];
+        edges.push({ from, to, label: m[3] ? clean(m[3], 20) : null });
+      }
+      continue;
+    }
+
+    if (/^(click|classDef|class\s|style\s|linkStyle|direction|%%|end$)/.test(line)) continue;
+    const sub = line.match(/^subgraph\s+([A-Za-z0-9_]+)\s*\[\s*"?([^\]"]+)"?\s*\]/) || line.match(/^subgraph\s+(\S+)$/);
+    if (sub) { if (sub[2]) labels[sub[1]] = sub[2]; continue; }
+
+    // node shape definitions -> bare id, label recorded
+    const shapeRe = /([A-Za-z0-9_]+)\s*(\(\[|\[\[|\(\(|\{\{|\[|\(|\{)\s*(?:"([^"]*)"|([^\]\)\}"]*?))\s*(\]\)|\]\]|\)\)|\}\}|\]|\)|\})/g;
+    line = line.replace(shapeRe, (_, id, _open, quoted, plain) => {
+      labels[id] = quoted !== undefined ? quoted : plain;
+      return id;
+    });
+
+    // normalize every arrow variant to `-->` or `-->|text|`
+    line = line
+      .replace(/<?-\.\s*"([^"]*)"\s*\.->/g, ' -->|$1| ')
+      .replace(/<?-\.->/g, " --> ")
+      .replace(/<?-\.\s*([^.>]*?)\s*\.->/g, ' -->|$1| ')
+      .replace(/<?--+\s*"([^"]*)"\s*--+>/g, ' -->|$1| ')
+      .replace(/<?==+\s*"([^"]*)"\s*==+>/g, ' -->|$1| ')
+      .replace(/-->\s*\|\s*"?([^|]*?)"?\s*\|/g, ' -->|$1| ')
+      .replace(/<?==+>/g, " --> ")
+      .replace(/<?--+>/g, " --> ")
+      .replace(/\s---+\s/g, " --> ");
+
+    // split into node segments on `-->`, expand `&` fan-in/fan-out
+    const parts = line.split(/-->\s*(\|[^|]*\|)?/);
+    if (parts.length === 1) {
+      const id = line.trim();
+      if (/^[A-Za-z0-9_]+$/.test(id)) standalone.add(id);
+      continue;
+    }
+    let prev = null;
+    for (let i = 0; i < parts.length; i += 2) {
+      const nodes = (parts[i] || "").split("&").map(s => s.trim()).filter(s => /^[A-Za-z0-9_]+$/.test(s));
+      if (!nodes.length) continue;
+      if (prev) {
+        const label = prev.labelPart ? clean(prev.labelPart.replace(/^\||\|$/g, ""), 20) : null;
+        for (const f of prev.nodes) for (const t of nodes) edges.push({ from: f, to: t, label });
+      }
+      prev = { nodes, labelPart: parts[i + 1] || null };
+    }
+  }
+
+  const out = [`graph ${dir === "TB" ? "TD" : dir}`];
+  const connected = new Set();
+  for (const e of edges) {
+    connected.add(e.from); connected.add(e.to);
+    out.push(e.label ? `${name(e.from)} -->|${e.label}| ${name(e.to)}` : `${name(e.from)} --> ${name(e.to)}`);
+  }
+  for (const id of standalone) if (!connected.has(id)) out.push(name(id));
+  return out.join("\n");
+}
+
+// ---------- render ----------
+function render(code) {
+  const tmp = path.join(os.tmpdir(), `mmd-${process.pid}-${Math.random().toString(36).slice(2)}.mmd`);
+  fs.writeFileSync(tmp, code + "\n");
+  const args = ["-y", "mermaid-ascii", "-f", tmp];
+  if (opts.ascii) args.push("-a");
+  const res = spawnSync("npx", args, { encoding: "utf8" });
+  fs.unlinkSync(tmp);
+  if (res.status !== 0) {
+    process.stderr.write(res.stderr || "mermaid-ascii failed\n");
+    process.stderr.write("--- preprocessed input was ---\n" + code + "\n");
+    return false;
+  }
+  process.stdout.write(res.stdout.replace(/^npm notice.*\n/gm, ""));
+  return true;
+}
+
+// ---------- main ----------
+let text;
+try { text = fs.readFileSync(file, "utf8"); }
+catch { console.error(`cannot read ${file}`); process.exit(1); }
+const blocks = extractBlocks(text, /\.mmd$/.test(file));
+if (!blocks.length) { console.error(`no mermaid blocks in ${file}`); process.exit(1); }
+
+if (opts.list) {
+  blocks.forEach((b, i) => console.log(`${i + 1}. ${b.title || "(no heading)"} — ${b.code.trim().split("\n")[0]}`));
+  process.exit(0);
+}
+
+const selected = only ? [blocks[only - 1]].filter(Boolean) : blocks;
+if (!selected.length) { console.error(`block ${only} not found (${blocks.length} block(s) in file)`); process.exit(1); }
+
+if (opts.web) {
+  const data = JSON.stringify(selected.map(b => ({ title: b.title, code: b.code })));
+  const html = `<!doctype html>
+<meta charset="utf-8">
+<title>${path.basename(file)} — diagrams</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
+  h2 { border-bottom: 1px solid #ddd; padding-bottom: .3rem; margin-top: 2.5rem; }
+  .mermaid { margin: 1rem 0; }
+</style>
+<h1>${path.basename(file)}</h1>
+<div id="out"></div>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  const blocks = ${data};
+  const out = document.getElementById("out");
+  for (const b of blocks) {
+    if (b.title) { const h = document.createElement("h2"); h.textContent = b.title; out.appendChild(h); }
+    const pre = document.createElement("pre");
+    pre.className = "mermaid";
+    pre.textContent = b.code;
+    out.appendChild(pre);
+  }
+  mermaid.initialize({ startOnLoad: false, theme: "default" });
+  await mermaid.run({ querySelector: ".mermaid" });
+</script>`;
+  const outFile = path.join(os.tmpdir(), "flypy-diagrams.html");
+  fs.writeFileSync(outFile, html);
+  const opened = spawnSync(process.platform === "darwin" ? "open" : "xdg-open", [outFile]);
+  console.log(opened.status === 0 ? `opened ${outFile}` : `wrote ${outFile} — open it in a browser`);
+  process.exit(0);
+}
+
+let ok = true;
+for (const b of selected) {
+  if (selected.length > 1 || b.title) console.log(`\n═══ ${b.title || "diagram"} ═══\n`);
+  ok = render(opts.raw ? b.code : preprocess(b.code, opts)) && ok;
+}
+process.exit(ok ? 0 : 1);

@@ -1,0 +1,723 @@
+# Entry point and asyncio main loop.
+#
+# State machine:
+#   DISARMED -> config portal (WiFi AP + web server) runs; flight outputs idle.
+#   ARMED    -> portal torn down, 250 Hz flight loop runs: RC in, attitude
+#               estimate, mixer, servos + Oneshot125 ESC out. Failsafe: RC
+#               link lost -> level wings (stabilized loop, 0 deg pitch
+#               target) + cut throttle, in every mode; if the link stays
+#               dead past _LINK_LOST_DISARM_MS the loop gives up and
+#               returns to the portal (throttle has long been cut, and a
+#               dead RX must not require a power cycle to reach config).
+# Arming: fresh RC frame (within the failsafe timeout) AND TX arm switch AND
+# throttle below arm_max_throttle_us (owner rule). Disarming returns to the
+# config portal. Any exception inside the armed loop still forces outputs
+# safe (try/finally) -- PWM is hardware, so without that a crash would leave
+# the motor spinning at its last commanded throttle.
+#
+# Mode handling: manual = raw passthrough. stabilized = INAV-style fixed-wing
+# cascade: pitch is an outer angle (level) loop feeding an inner rate loop,
+# yaw is rate-only (INAV never gives yaw an angle mode either). Roll stick
+# has no axis of its own (no roll actuator -- see control-system-design.md)
+# and instead feeds the yaw rate target for turn coordination.
+#
+# autonomous = the nav.Navigator synthesizes the same pitch/yaw/throttle
+# demands the pilot's sticks would, feeding the identical stabilized
+# cascade -- it is a third demand source, not a separate control path. It
+# engages only through nav.py's gates (fix quality, heading validity, a
+# valid mission near home); a blocked engage degrades to stabilized under
+# pilot control rather than leaving the aircraft uncommanded. GPS lost
+# while navigating levels the wings and cuts throttle, per the owner's
+# recorded failsafe decision.
+#
+# Gain scaling matches INAV `master` exactly (`flight/pid.c`, `flight/pid.h`):
+# raw config gains are INAV's own settings.yaml numbers, divided by INAV's
+# scale constants below before use, summed (P+I+D+FF) and clamped to
+# INAV's +/-500 pidSumLimit, then normalized to our own [-1, 1] mixer
+# convention. See control-system-design.md for full citations.
+
+import asyncio
+import gc
+import time
+from math import degrees
+
+# server first, deliberately. It pulls in microdot -- ~60 KB of source, by
+# far the largest thing MicroPython has to compile here -- and compiling it
+# needs a big contiguous working block. Importing it before the rest of the
+# firmware carves up the heap is the difference between booting and dying
+# with "MemoryError: allocating 3112 bytes" inside microdot's own import.
+# Same principle as claiming the UART ring buffers first in main().
+import server  # isort:skip
+
+import auxpins
+import config as config_module
+import logic as logic_module
+import mission as mission_module
+import nav as nav_module
+import pins
+from attitude import MahonyFilter
+from compass import QMC5883, flat_field_angle_deg
+from esc import LOOP_FREQUENCY_HZ, EscOutput
+from gps import UbxGps
+from imu import MPU6050
+from led import StatusLed
+from mixer import VTailMixer
+from nav import Navigator
+from pid import PID
+from rc import CrsfReceiver
+from servos import ServoOutput
+
+# Single source: the Oneshot125 slice trick requires the ESC PWM period to
+# equal the flight-loop period, so the rate is defined once, in esc.py.
+FLIGHT_LOOP_HZ = LOOP_FREQUENCY_HZ
+_LOOP_PERIOD_S = 1.0 / FLIGHT_LOOP_HZ
+_LOOP_PERIOD_US = 1_000_000 // FLIGHT_LOOP_HZ
+# dt fed to the estimator/PIDs is measured, not assumed (the loop sleeps a
+# fixed remainder, so real period = body time + sleep); clamp insane gaps
+# (debugger pause, one-off stall) back to nominal instead of integrating
+# across them.
+_MAX_DT_S = 0.05
+_DISARMED_POLL_MS = 100
+_GYRO_CALIBRATION_SAMPLES = 200
+# Armed with the link dead this long -> throttle has been cut the whole
+# time; return to the portal rather than staying wedged in a loop only a
+# live RC frame could exit.
+_LINK_LOST_DISARM_MS = 30_000
+# INAV's pos_failure_timeout: how long a stale/absent position estimate is
+# tolerated in autonomous before the failsafe procedure runs.
+_NAV_GPS_TIMEOUT_MS = 5000
+
+_PORTAL_RESTART_DELAY_MS = 250
+_PORTAL_MAX_FAILURES = 5
+
+# INAV flight/pid.h scale constants (fixed-wing PIFF controller).
+_PID_P_MULTIPLIER = 31.0
+_PID_I_MULTIPLIER = 4.0
+_PID_D_MULTIPLIER = 1905.0
+_PID_FF_MULTIPLIER = 31.0
+_LEVEL_P_MULTIPLIER = 1.0 / 6.56
+# INAV's pidSumLimit default (flight/pid.c getPidSumLimit()); the summed
+# P+I+D+FF clamps to this before being normalized to our own [-1, 1] scale.
+_PID_SUM_LIMIT = 500.0
+
+
+def _pid_gains(config, prefix):
+    return (
+        config["pid_" + prefix + "_p"] / _PID_P_MULTIPLIER,
+        config["pid_" + prefix + "_i"] / _PID_I_MULTIPLIER,
+        config["pid_" + prefix + "_d"] / _PID_D_MULTIPLIER,
+        config["pid_" + prefix + "_ff"] / _PID_FF_MULTIPLIER,
+    )
+
+
+def _scaled_pid(config, prefix, output_limit=_PID_SUM_LIMIT):
+    kp, ki, kd, kff = _pid_gains(config, prefix)
+    return PID(kp, ki, kd, kff=kff, output_limit=output_limit)
+
+
+def _loop_gains(config):
+    # The handful of values the 250 Hz path reads directly. Re-read only when
+    # user logic changes something, so the fast path keeps using locals.
+    return (
+        config["failsafe_link_timeout_ms"],
+        config["pitch_angle_max_deg"],
+        config["pitch_level_p"],
+        config["pitch_rate_limit_dps"],
+        config["rate_yaw_dps"],
+        config["turn_assist_gain"],
+    )
+
+
+def _fill_logic_namespace(ns, rc, gps, navigator, attitude, accel_g, gyro_rad_s,
+                          flight_mode, aux, compass_reading, now_ms, armed_ms,
+                          dt_s, loop_hz):
+    # Reused dict, updated in place: at 25 Hz the cost is negligible either
+    # way, but this keeps the flight loop free of per-pass allocation.
+    channels = rc.channels
+    ns["throttle"] = channels["throttle"]
+    ns["pitch"] = channels["pitch"]
+    ns["roll"] = channels["roll"]
+    ns["yaw"] = channels["yaw"]
+    ns["throttle_us"] = rc.throttle_us
+    ns["arm_switch"] = rc.arm_switch_on
+    ns["mode"] = rc.mode
+    ns["flight_mode"] = flight_mode
+    ns["armed"] = True
+    ns["link_ok"] = rc.link_alive
+    ns["link_age_ms"] = time.ticks_diff(now_ms, rc.last_frame_ms)
+    raw = rc.raw_channels
+    for index in range(16):
+        ns["ch%d" % (index + 1)] = raw[index]
+
+    ns["roll_deg"] = attitude.roll_deg
+    ns["pitch_deg"] = attitude.pitch_deg
+    ns["roll_rate"] = degrees(gyro_rad_s[0])
+    ns["pitch_rate"] = degrees(gyro_rad_s[1])
+    ns["yaw_rate"] = degrees(gyro_rad_s[2])
+    ax, ay, az = accel_g
+    ns["accel_x"] = ax
+    ns["accel_y"] = ay
+    ns["accel_z"] = az
+    ns["accel_mag"] = (ax * ax + ay * ay + az * az) ** 0.5
+
+    ns["compass_ok"] = compass_reading is not None
+    if compass_reading is None:
+        ns["heading_deg"] = 0.0
+        ns["mag_x"] = ns["mag_y"] = ns["mag_z"] = 0.0
+    else:
+        mx, my, mz, heading = compass_reading
+        ns["mag_x"] = mx
+        ns["mag_y"] = my
+        ns["mag_z"] = mz
+        ns["heading_deg"] = heading
+
+    ns["gps_fix"] = gps.fix_ok
+    ns["fix_type"] = gps.fix_type
+    ns["sats"] = gps.num_sv
+    ns["lat"] = gps.lat_deg
+    ns["lon"] = gps.lon_deg
+    ns["gps_alt_m"] = gps.alt_m
+    ns["ground_speed_ms"] = gps.ground_speed_ms
+    ns["course_deg"] = gps.course_deg
+    ns["h_acc_m"] = gps.h_acc_m
+    ns["v_acc_m"] = gps.v_acc_m
+    ns["course_acc_deg"] = gps.course_acc_deg
+    ns["gps_age_ms"] = (
+        -1 if gps.last_pvt_ms is None
+        else time.ticks_diff(now_ms, gps.last_pvt_ms)
+    )
+
+    ns["nav_state"] = navigator.state
+    # 1-based to match the numbering the Mission page shows.
+    ns["wp_index"] = navigator.index + 1
+    ns["wp_total"] = len(navigator.waypoints)
+    _fill_nav_geometry(ns, navigator, gps)
+
+    ns["armed_ms"] = armed_ms
+    ns["uptime_ms"] = now_ms
+    ns["loop_hz"] = loop_hz
+    ns["dt_s"] = dt_s
+    ns["mem_free"] = gc.mem_free()
+
+    for number in auxpins.ADC_PINS:
+        ns["adc%d" % number] = aux.read_adc(number)
+
+
+def _fill_nav_geometry(ns, navigator, gps):
+    home = navigator.home
+    if home is None or not gps.fix_ok:
+        ns["home_lat"] = ns["home_lon"] = ns["home_alt_m"] = 0.0
+        ns["home_distance_m"] = ns["home_bearing_deg"] = 0.0
+        ns["alt_above_home_m"] = 0.0
+        ns["wp_distance_m"] = ns["wp_bearing_deg"] = ns["xtrack_m"] = 0.0
+        return
+    ns["home_lat"] = home[0]
+    ns["home_lon"] = home[1]
+    ns["home_alt_m"] = home[2]
+    ns["alt_above_home_m"] = gps.alt_m - home[2]
+    north, east = nav_module.local_offsets(home[0], home[1], gps.lat_deg, gps.lon_deg)
+    ns["home_distance_m"] = nav_module.distance_m(north, east)
+    ns["home_bearing_deg"] = nav_module.bearing_deg(-north, -east)
+    if not navigator.waypoints or navigator.index >= len(navigator.waypoints):
+        ns["wp_distance_m"] = ns["wp_bearing_deg"] = ns["xtrack_m"] = 0.0
+        return
+    waypoint = navigator.waypoints[navigator.index]
+    wp_n, wp_e = nav_module.local_offsets(
+        home[0], home[1], waypoint["lat"], waypoint["lon"]
+    )
+    ns["wp_distance_m"] = nav_module.distance_m(wp_n - north, wp_e - east)
+    ns["wp_bearing_deg"] = nav_module.bearing_deg(wp_n - north, wp_e - east)
+    start_lat, start_lon = navigator._leg_start()
+    start_n, start_e = nav_module.local_offsets(home[0], home[1], start_lat, start_lon)
+    ns["xtrack_m"] = nav_module.cross_track_m(
+        start_n, start_e, wp_n, wp_e, north, east
+    )
+
+
+class FlightOutputs:
+    def __init__(self, config):
+        self.servo_left = ServoOutput(
+            pins.SERVO_LEFT_PIN, config["servo_left_min_us"], config["servo_left_max_us"]
+        )
+        self.servo_right = ServoOutput(
+            pins.SERVO_RIGHT_PIN,
+            config["servo_right_min_us"],
+            config["servo_right_max_us"],
+        )
+        self.esc = EscOutput(pins.ESC_PIN)
+        self.go_safe()
+
+    def apply_endpoints(self, config):
+        self.servo_left.set_endpoints(
+            config["servo_left_min_us"], config["servo_left_max_us"]
+        )
+        self.servo_right.set_endpoints(
+            config["servo_right_min_us"], config["servo_right_max_us"]
+        )
+
+    def go_safe(self):
+        self.servo_left.center()
+        self.servo_right.center()
+        self.esc.stop()
+
+    def release(self):
+        self.esc.release()
+        self.servo_left.release()
+        self.servo_right.release()
+
+
+def _link_fresh(rc, config, now_ms):
+    if not rc.link_alive:
+        return False
+    silence_ms = time.ticks_diff(now_ms, rc.last_frame_ms)
+    return silence_ms <= config["failsafe_link_timeout_ms"]
+
+
+def _arm_requested(rc, config, now_ms):
+    # A live link is required to arm: without the freshness check, a frame
+    # latched before the link died (switch on, throttle low) would arm the
+    # plane off stale data.
+    return (
+        _link_fresh(rc, config, now_ms)
+        and rc.arm_switch_seen_off  # never arm on a switch latched since boot
+        and rc.arm_switch_on
+        and rc.throttle_us <= config["arm_max_throttle_us"]
+    )
+
+
+class _Portal:
+    # Owns the web-server task. An exception inside a bare
+    # create_task(app.start_server(...)) sits silently in the task object
+    # until the next await -- a portal that never comes back after disarm,
+    # with no error printed anywhere. The disarmed poll loop calls check():
+    # a dead server task gets its error printed and the server restarted;
+    # if it keeps dying, hard-reset into the fresh-boot path, which is
+    # known-good (config lives in flash; no RAM state matters while
+    # disarmed).
+    def __init__(self, make_app):
+        self._make_app = make_app
+        self._failures = 0
+        self._start()
+
+    def _start(self):
+        self._app = self._make_app()
+        self._task = asyncio.create_task(self._app.start_server(port=80))
+
+    async def _collect(self, verb):
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        except Exception as error:
+            print("portal web server", verb, "error:", repr(error))
+            return True
+        return False
+
+    async def check(self):
+        if not self._task.done():
+            return
+        # Only shutdown() ends start_server cleanly, and stop() is the only
+        # caller of shutdown() -- a finished task here means the server died.
+        await self._collect("died with")
+        self._failures += 1
+        if self._failures >= _PORTAL_MAX_FAILURES:
+            print("portal keeps failing; resetting to recover")
+            import machine
+
+            machine.reset()
+        await asyncio.sleep_ms(_PORTAL_RESTART_DELAY_MS)
+        print("restarting portal web server")
+        self._start()
+
+    async def stop(self):
+        if self._task.done():
+            pass  # already dead; just collect the error below
+        elif self._app.server is not None:
+            self._app.shutdown()
+        else:
+            # start_server hasn't gotten far enough to have a server to
+            # close (shutdown() would AttributeError on None); cancel it.
+            self._task.cancel()
+        await self._collect("shutdown")
+
+
+async def _wait_for_arm_request(rc, gps, current_config, led, portal):
+    led.set_mode("blink_slow")
+    while True:
+        now_ms = _now_ms()
+        rc.update(now_ms)
+        # GPS is polled while disarmed only (nav is deferred; the portal
+        # shows fix status and the driver re-sends its boot config as
+        # needed). The armed loop ignores it until the nav part lands.
+        gps.update(now_ms)
+        led.tick(now_ms)
+        await portal.check()
+        if _arm_requested(rc, current_config(), now_ms):
+            return
+        await asyncio.sleep_ms(_DISARMED_POLL_MS)
+
+
+def _gps_lost(gps, now_ms):
+    # INAV's pos_failure_timeout (5 s) before it gives up on the position
+    # estimate and switches to its emergency procedure.
+    if gps.last_pvt_ms is None:
+        return True
+    if time.ticks_diff(now_ms, gps.last_pvt_ms) > _NAV_GPS_TIMEOUT_MS:
+        return True
+    return not gps.fix_ok
+
+
+def _autonomous_demands(navigator, gps, rc, now_ms):
+    # Returns (mode, throttle, pitch_stick, yaw_stick).
+    #
+    # A blocked engage degrades to stabilized under pilot control rather
+    # than refusing to fly -- the switch position must never leave the
+    # aircraft without a controller. Matches the MVP fallback behaviour,
+    # except it now reports why.
+    if navigator.state == "idle":
+        blocker = navigator.engage_blocker(gps)
+        if blocker:
+            if blocker != navigator.blocked_reason:
+                print("autonomous unavailable:", blocker)
+                navigator.blocked_reason = blocker
+            return (
+                "stabilized",
+                rc.channels["throttle"],
+                rc.channels["pitch"],
+                rc.channels["yaw"],
+            )
+        navigator.blocked_reason = None
+        navigator.engage()
+        print("autonomous engaged: %d waypoints" % len(navigator.waypoints))
+
+    if _gps_lost(gps, now_ms):
+        # Owner's recorded decision (flight-modes-arming-failsafe.md): GPS
+        # lost in autonomous -> level out and cut throttle. INAV instead
+        # flies a controlled descent at emerg_descent_rate; that difference
+        # is deliberate and still worth revisiting on a real airframe.
+        if navigator.state != "idle":
+            print("GPS lost in autonomous: levelling and cutting throttle")
+            navigator.disengage()
+        return "nav_lost", 0.0, 0.0, 0.0
+
+    navigator.update(gps)
+    return "autonomous", navigator.throttle, navigator.pitch_stick, navigator.yaw_stick
+
+
+def _load_logic(logic_engine):
+    # Stored source is re-validated at boot rather than trusted: a file
+    # hand-edited over USB, or written by an older schema, must not activate
+    # rules that no longer compile.
+    source = logic_module.load()
+    if not source.strip():
+        return
+    rules, errors = logic_engine.load_source(source)
+    if errors:
+        print("logic disabled,", len(errors), "error(s); first:", errors[0])
+        logic_engine.clear()
+        logic_engine.source = source
+        logic_engine.errors = [str(e) for e in errors]
+        return
+    logic_engine.activate(source, rules)
+    print("logic: %d rule%s active" % (len(rules), "" if len(rules) == 1 else "s"))
+
+
+def _capture_home(navigator, gps, config):
+    # Home is the first good fix after arming -- INAV's GPS_FIX_HOME. Set
+    # once per armed session so a mid-flight fix wobble can't move it.
+    if navigator.home is not None or not gps.fix_ok:
+        return False
+    if gps.num_sv < int(config["nav_min_sats"]):
+        return False
+    if gps.h_acc_m > config["nav_max_h_acc_m"]:
+        return False
+    navigator.set_home(gps.lat_deg, gps.lon_deg, gps.alt_m)
+    print("home set: %.6f, %.6f, %.1f m" % (gps.lat_deg, gps.lon_deg, gps.alt_m))
+    return True
+
+
+async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux):
+    # Defense in depth: nothing should be driving outputs while disarmed
+    # (the portal's bench-test pages that once did are gone), but IMU init +
+    # gyro calibration below take the better part of a second, so start from
+    # a known-safe output state unconditionally.
+    outputs.go_safe()
+    try:
+        imu = MPU6050()
+        imu.calibrate_gyro(sample_count=_GYRO_CALIBRATION_SAMPLES)  # plane at rest, each arm
+    except OSError as error:
+        # IMU missing/unwired: refuse to arm rather than crash the whole
+        # firmware. The config portal must stay reachable regardless of
+        # what's wired up yet, so this only blocks entering the flight loop,
+        # not boot. Exits on disarm OR link loss -- with a dead RX the arm
+        # switch can never read off, and outputs are already safe.
+        print("IMU init failed, refusing to arm:", error)
+        led.set_mode("blink_fast")
+        while rc.arm_switch_on:
+            now_ms = _now_ms()
+            rc.update(now_ms)
+            led.tick(now_ms)
+            if not _link_fresh(rc, config, now_ms):
+                break
+            await asyncio.sleep_ms(_DISARMED_POLL_MS)
+        return
+    # Calibration blocks long enough for ELRS to overrun the UART buffer;
+    # the backlog is truncated garbage, so drop it rather than resync
+    # through it on the first iterations.
+    rc.flush()
+
+    attitude = MahonyFilter()
+    pitch_pid = _scaled_pid(config, "pitch")
+    yaw_pid = _scaled_pid(config, "yaw")
+    mixer = VTailMixer(config)
+    # Working copy: user logic overrides land here, leaving the saved config
+    # untouched so a rule can never write itself into flash.
+    effective = dict(config)
+    (link_timeout_ms, pitch_angle_max_deg, pitch_level_p,
+     pitch_rate_limit_dps, rate_yaw_dps, turn_assist_gain) = _loop_gains(effective)
+    active_mode = None
+    # Mission is re-read at each arm, so a plan saved from the portal is
+    # picked up without a reboot.
+    navigator = Navigator(config, mission_module.load())
+    logic_namespace = {}
+    compass_reading = None
+    compass_sensor = None
+    if logic_engine.enabled:
+        try:
+            compass_sensor = QMC5883()
+        except OSError:
+            compass_sensor = None
+    led.set_mode("solid")
+
+    iterations = 0
+    overruns = 0
+    started_ms = _now_ms()
+    last_us = time.ticks_us()
+    try:
+        while rc.arm_switch_on:
+            now_ms = _now_ms()
+            rc.update(now_ms)
+            # Cheap at a 5 Hz fix rate: most iterations read an empty UART.
+            gps.update(now_ms)
+            _capture_home(navigator, gps, config)
+            led.tick(now_ms)
+
+            # Measured dt: the loop sleeps a fixed remainder, so the real
+            # period is body time + sleep, not the nominal 4 ms -- feeding
+            # the nominal value would mis-scale gyro integration and the
+            # PID I/D terms by the overrun ratio.
+            now_us = time.ticks_us()
+            dt_s = time.ticks_diff(now_us, last_us) / 1_000_000
+            last_us = now_us
+            if dt_s <= 0.0 or dt_s > _MAX_DT_S:
+                dt_s = _LOOP_PERIOD_S
+
+            # Standard body-axis mounting: gyro x/y/z = roll/pitch/yaw rate.
+            accel_g, gyro_rad_s = imu.read()
+            attitude.update(gyro_rad_s, accel_g, dt_s)
+            measured_pitch_rate_dps = degrees(gyro_rad_s[1])
+            measured_yaw_rate_dps = degrees(gyro_rad_s[2])
+
+            silence_ms = time.ticks_diff(now_ms, rc.last_frame_ms)
+            link_lost = not rc.link_alive or silence_ms > link_timeout_ms
+            if link_lost and silence_ms > _LINK_LOST_DISARM_MS:
+                break
+
+            # Failsafe behaves as a mode of its own: stabilized flight
+            # toward level (0 deg pitch target, zero yaw/roll demand) with
+            # throttle cut -- in manual too, since centered surfaces are
+            # not "level wings". Treating it as a mode also resets the PIDs
+            # on both entry and exit, so no stale integrator on regain.
+            if link_lost:
+                led.set_mode("blink_fast")
+                mode = "failsafe"
+                throttle = 0.0
+                pitch_stick = yaw_stick = roll_stick = 0.0
+                if navigator.state != "idle":
+                    navigator.disengage()
+            else:
+                led.set_mode("solid")
+                mode = rc.mode
+                roll_stick = 0.0
+                if mode == "autonomous":
+                    mode, throttle, pitch_stick, yaw_stick = _autonomous_demands(
+                        navigator, gps, rc, now_ms
+                    )
+                else:
+                    if navigator.state != "idle":
+                        navigator.disengage()
+                    throttle = rc.channels["throttle"]
+                    pitch_stick = rc.channels["pitch"]
+                    yaw_stick = rc.channels["yaw"]
+                    roll_stick = rc.channels["roll"]
+
+            # User logic runs HERE -- after the demands are settled (so it
+            # sees the real mode) and before the cascade consumes them, so a
+            # parameter it changes takes effect this iteration rather than
+            # the next.
+            if logic_engine.due(now_ms):
+                if compass_sensor is not None:
+                    try:
+                        mx, my, mz = compass_sensor.read()
+                        compass_reading = (mx, my, mz, flat_field_angle_deg(mx, my))
+                    except OSError:
+                        compass_reading = None
+                _fill_logic_namespace(
+                    logic_namespace, rc, gps, navigator, attitude, accel_g,
+                    gyro_rad_s, mode, aux, compass_reading, now_ms,
+                    time.ticks_diff(now_ms, started_ms), dt_s,
+                    iterations * 1000 // max(time.ticks_diff(now_ms, started_ms), 1),
+                )
+                logic_engine.evaluate(logic_namespace, now_ms)
+                if logic_engine.overrides:
+                    effective.update(logic_engine.overrides)
+                    (link_timeout_ms, pitch_angle_max_deg, pitch_level_p,
+                     pitch_rate_limit_dps, rate_yaw_dps,
+                     turn_assist_gain) = _loop_gains(effective)
+                    pitch_pid.set_gains(*_pid_gains(effective, "pitch"))
+                    yaw_pid.set_gains(*_pid_gains(effective, "yaw"))
+                    mixer.set_gains(effective)
+                    navigator.configure(effective)
+                    outputs.apply_endpoints(effective)
+                if logic_engine.pin_states:
+                    aux.apply(logic_engine.pin_states)
+
+            # Demand overrides, applied every iteration from the values the
+            # last evaluation held (the same hold-between-updates the nav
+            # loop already relies on at 5 Hz). When they are refused the
+            # rules still evaluate, so their values stay visible on the
+            # status page -- only the application is skipped. The rule for
+            # when they may apply lives in logic.demands_allowed().
+            if logic_engine.demands and logic_module.demands_allowed(link_lost):
+                throttle = logic_engine.demands.get("throttle_demand", throttle)
+                pitch_stick = logic_engine.demands.get("pitch_demand", pitch_stick)
+                yaw_stick = logic_engine.demands.get("yaw_demand", yaw_stick)
+                roll_stick = logic_engine.demands.get("roll_demand", roll_stick)
+
+            if mode != active_mode:
+                pitch_pid.reset()
+                yaw_pid.reset()
+                active_mode = mode
+
+            if mode == "manual":
+                pitch_cmd = pitch_stick
+                yaw_cmd = yaw_stick
+            else:
+                # Outer level loop (pitch only -- INAV never gives yaw an
+                # angle mode): angle error -> a rate target, ceiling-clamped.
+                target_pitch_deg = pitch_stick * pitch_angle_max_deg
+                angle_error_deg = target_pitch_deg - attitude.pitch_deg
+                pitch_rate_target_dps = angle_error_deg * (pitch_level_p * _LEVEL_P_MULTIPLIER)
+                pitch_rate_target_dps = min(
+                    max(pitch_rate_target_dps, -pitch_rate_limit_dps), pitch_rate_limit_dps
+                )
+
+                # Inner rate loop, pitch: P+I+D+FF on (rate target - measured).
+                pitch_rate_error_dps = pitch_rate_target_dps - measured_pitch_rate_dps
+                pitch_sum = pitch_pid.update(
+                    pitch_rate_error_dps, dt_s,
+                    feedforward_input=pitch_rate_target_dps,
+                )
+                pitch_cmd = pitch_sum / _PID_SUM_LIMIT
+
+                # Yaw: rate-only, stick + turn-coordination folded into one
+                # target rate -- no outer loop.
+                yaw_rate_target_dps = (
+                    yaw_stick * rate_yaw_dps
+                    + roll_stick * turn_assist_gain
+                )
+                yaw_rate_error_dps = yaw_rate_target_dps - measured_yaw_rate_dps
+                yaw_sum = yaw_pid.update(
+                    yaw_rate_error_dps, dt_s,
+                    feedforward_input=yaw_rate_target_dps,
+                )
+                yaw_cmd = yaw_sum / _PID_SUM_LIMIT
+
+            left, right = mixer.mix(pitch_cmd, yaw_cmd)
+            outputs.servo_left.set_normalized(left)
+            outputs.servo_right.set_normalized(right)
+            outputs.esc.set_throttle(throttle)
+
+            iterations += 1
+            remaining_us = _LOOP_PERIOD_US - time.ticks_diff(time.ticks_us(), now_us)
+            if remaining_us <= 0:
+                overruns += 1
+                await asyncio.sleep_ms(0)
+            else:
+                await asyncio.sleep_ms(remaining_us // 1000)
+    finally:
+        # Runs on disarm, link-loss timeout, AND any exception (e.g. a
+        # transient I2C error in imu.read()): PWM is hardware, so without
+        # this a crash would leave the motor at its last commanded throttle.
+        outputs.go_safe()
+        # Logic-driven pins are armed-only: they fall to a known state on
+        # disarm rather than holding whatever the last rule commanded while
+        # someone is handling the aircraft.
+        aux.all_off()
+        led.set_mode("blink_slow")
+        total_ms = time.ticks_diff(_now_ms(), started_ms)
+        if iterations and total_ms > 0:
+            print(
+                "flight loop: %d iterations, ~%d Hz achieved (target %d), %d overruns"
+                % (iterations, iterations * 1000 // total_ms, FLIGHT_LOOP_HZ, overruns)
+            )
+
+
+async def main():
+    # Allocation ORDER matters here, not just total free memory. Importing
+    # this module pulls in server + microdot (~60 KB) and leaves the heap
+    # fragmented; MicroPython's collector never compacts, so the UART ring
+    # buffers -- by far the largest contiguous requests the firmware makes --
+    # must be claimed before anything else carves up what's left. Boot used
+    # to die here with "MemoryError: allocating 4097 bytes" while ~97 KB was
+    # still free overall. Collect first, take the big buffers, then build the
+    # small stuff.
+    gc.collect()
+    rc = CrsfReceiver(config_module.defaults())
+    gps = UbxGps()
+    gc.collect()
+    active_config = config_module.load()
+    rc.set_channel_map(active_config)
+    outputs = FlightOutputs(active_config)
+    led = StatusLed()
+    aux = auxpins.AuxPins()
+    free_pins = auxpins.free_pins()
+    logic_engine = logic_module.LogicEngine(config_module.SCHEMA, free_pins)
+    _load_logic(logic_engine)
+    print("boot: hardware ready, %d bytes free" % gc.mem_free())
+
+    def current_config():
+        return active_config
+
+    def persist(updated_config):
+        nonlocal active_config
+        active_config = updated_config
+        config_module.save(updated_config)
+        rc.set_channel_map(updated_config)
+        # Endpoints are otherwise baked into the ServoOutputs at boot; apply
+        # them live so a save is reflected in the bench pages and the next
+        # arm without a reboot.
+        outputs.apply_endpoints(updated_config)
+
+    def make_app():
+        return server.create_app(current_config, persist, rc, gps,
+                                 logic_engine, free_pins)
+
+    while True:
+        access_point = server.start_access_point(active_config)
+        portal = _Portal(make_app)
+        try:
+            await _wait_for_arm_request(rc, gps, current_config, led, portal)
+        finally:
+            await portal.stop()
+            server.stop_access_point(access_point)
+        await _run_flight_loop(rc, gps, active_config, outputs, led,
+                               logic_engine, aux)
+
+
+def _now_ms():
+    return time.ticks_ms()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

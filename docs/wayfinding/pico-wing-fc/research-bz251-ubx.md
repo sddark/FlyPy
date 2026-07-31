@@ -18,3 +18,5 @@ What does the spec need to say about driving the BZGNSS BZ-251 (u-blox M10) from
 ## Decision
 
 M10 configured via UBX-CFG-VALSET (RAM layer, every boot): 5 Hz nav rate, airborne <4g dynamic model, NAV-PVT on, all NMEA off. Default baud 115 200. NAV-PVT field map documented; bespoke ~100-line driver recommended over porting a library. TTFF ~27 s cold. Full findings: [docs/research/bz251-ubx.md](../../research/bz251-ubx.md)
+
+**Correction (2026-07-29):** the "no magnetometer" assumption above is wrong — the owner's BZ-251 module carries an onboard **QMC5883 compass** alongside the M10 GPS chip. This doesn't change the UBX/NAV-PVT decision here (that's the GPS chip only, a separate I²C/register interface), but it does mean a real magnetometer-based heading reference is available in hardware. This part's UBX driver scope doesn't grow to include the compass automatically — a QMC5883 driver and its integration into the attitude/heading estimate is undecided and belongs to [Autonomous navigation design](./autonomous-navigation.md) and [Research: MPU6050 attitude estimation](./research-mpu6050-attitude.md) (both also corrected) when that work resumes.
