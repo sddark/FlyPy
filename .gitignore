@@ -1,1 +1,10 @@
 .pi-subagents/
+
+# CPython bytecode -- host-side test artifacts, useless to the MicroPython target
+__pycache__/
+*.py[cod]
+
+# Test tooling
+.pytest_cache/
+
+.DS_Store
