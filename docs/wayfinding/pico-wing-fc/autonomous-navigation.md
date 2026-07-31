@@ -34,7 +34,7 @@ INAV's fixed-wing guidance emits a **bank angle**: `navHeadingError = wrap_18000
 - **Altitude:** error → pitch angle with INAV's asymmetric `nav_fw_climb_angle` 20° / `nav_fw_dive_angle` 15° limits, plus `nav_fw_pitch2thr`-style throttle coupling over a cruise/min/max band (40/20/70 %, converted from INAV's 1400/1200/1700 µs).
 - **Engage gates** (INAV's `NAV_STATE_WAYPOINT_INITIALIZE` equivalents): fix OK, satellite count, horizontal accuracy, **minimum ground speed** (standing in for `estHeadingStatus`, since course-over-ground is meaningless when slow), a stored mission, a home position, and INAV's `nav_wp_max_safe_distance` check that waypoint 1 is near the arming point. A blocked engage **degrades to stabilized under pilot control** — the switch position never leaves the aircraft uncommanded — and prints the reason.
 - **Home:** first good fix after arming (INAV's `GPS_FIX_HOME`), set once per armed session.
-- **End of mission:** `nav_end_action` — orbit the last waypoint (default) or fly home and orbit. Chosen over INAV's per-waypoint action types (`WAYPOINT`/`RTH`/`LAND`/`JUMP`/…), which need a richer mission schema than the tap-to-place editor produces; revisit if missions get more complex.
+- **End of mission:** `end_action`, one of `loiter` (orbit the last waypoint, default), `rth` (fly home, then orbit there) or `repeat` (rewind to waypoint 1 and fly the plan again). Stored **with the mission, not in config** — it is a property of this plan, not of the airframe, so loading a different mission brings its own ending. `repeat` is rejected below 2 waypoints, and on every lap after the first the tracked leg starts at the *last* waypoint rather than home, or cross-track would steer toward a line back to the launch point. Chosen over INAV's per-waypoint action types (`WAYPOINT`/`RTH`/`LAND`/`JUMP`/…), which need a richer mission schema than the tap-to-place editor produces; revisit if missions get more complex.
 - **GPS loss:** `_NAV_GPS_TIMEOUT_MS` = 5 s, matching INAV's `pos_failure_timeout`, then the owner's recorded procedure — level wings, cut throttle.
 
 ### Resolved fog
@@ -43,7 +43,7 @@ Mission entry is the web portal's tap-to-place editor (`mission.py` + `/mission`
 
 ### Open / carried forward
 
-- **Unflown.** Validated by 22 off-target tests including a kinematic simulation flying a 4-waypoint box, holding a loiter circle, climbing, and rejoining track from 150 m off-line. A simulation is not an airframe.
+- **Unflown.** Validated by 25 off-target tests including a kinematic simulation flying a 4-waypoint box, flying that box twice over on `repeat`, holding a loiter circle, climbing, and rejoining track from 150 m off-line. A simulation is not an airframe.
 - **GPS-loss procedure** deviates from INAV, which flies a controlled descent at `emerg_descent_rate` rather than cutting throttle. Owner decision stands; worth revisiting now that the mode actually exists.
 - Compass fusion (tilt compensation, hard/soft-iron calibration) for low-speed and ground heading.
 - No airspeed sensor, so INAV's `pidTurnAssistant` physics and `nav_min_ground_speed` throttle boost remain approximated.

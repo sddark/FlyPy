@@ -269,6 +269,48 @@ def test_end_of_mission_returns_home_when_configured():
     assert navigator.state == nav.STATE_LOITER
 
 
+def test_end_of_mission_repeats_from_the_last_waypoint():
+    # The lap wraparound: reaching the final waypoint rewinds to waypoint 1
+    # and stays flying, and the leg being tracked must now start at the LAST
+    # waypoint rather than home -- otherwise the cross-track term steers
+    # toward a line back to the launch point on every lap but the first.
+    waypoints = [make_waypoint(400.0, 0.0), make_waypoint(400.0, 400.0)]
+    navigator = make_navigator(waypoints, end_action=mission_module.END_REPEAT)
+    navigator.engage()
+    assert navigator._leg_start() == (_HOME_LAT, _HOME_LON)
+
+    gps = FakeGps(*offset_position(400.0, 0.0))
+    gps.tick()
+    navigator.update(gps)
+    assert navigator.index == 1
+
+    gps.lat_deg, gps.lon_deg = offset_position(400.0, 400.0)
+    gps.tick()
+    navigator.update(gps)
+    assert navigator.index == 0, "did not rewind to waypoint 1"
+    assert navigator.state == nav.STATE_RUN, "repeat must keep flying"
+    assert navigator.laps == 1
+    last = waypoints[-1]
+    assert navigator._leg_start() == (last["lat"], last["lon"])
+
+
+def test_repeat_does_not_instantly_reflow_the_closing_leg():
+    # Sitting on the last waypoint at the moment of the rewind, the aircraft
+    # must not also read waypoint 1 as already reached -- that would spin the
+    # index through the whole plan in a single fix.
+    waypoints = [make_waypoint(400.0, 0.0), make_waypoint(400.0, 400.0)]
+    navigator = make_navigator(waypoints, end_action=mission_module.END_REPEAT)
+    navigator.engage()
+    navigator.index = 1
+    gps = FakeGps(*offset_position(400.0, 400.0))
+    gps.tick()
+    navigator.update(gps)
+    assert (navigator.index, navigator.laps) == (0, 1)
+    gps.tick()
+    navigator.update(gps)
+    assert (navigator.index, navigator.laps) == (0, 1), "advanced without moving"
+
+
 def test_disengage_clears_demands():
     navigator = make_navigator([make_waypoint(400.0, 0.0)])
     navigator.engage()
@@ -352,6 +394,35 @@ def test_simulated_mission_visits_every_waypoint_and_loiters():
 
     assert navigator.state == nav.STATE_LOITER, "mission never completed"
     assert reached == [0, 1, 2, 3], "waypoints out of order: %r" % (reached,)
+
+
+def test_simulated_repeat_flies_the_circuit_more_than_once():
+    # Same box, but repeating: the plan has to come round to waypoint 1 and
+    # run again without ever settling into a loiter, and the second lap must
+    # visit the waypoints in the same order as the first.
+    waypoints = [
+        make_waypoint(300.0, 0.0, alt_m=120.0),
+        make_waypoint(300.0, 300.0, alt_m=120.0),
+        make_waypoint(0.0, 300.0, alt_m=100.0),
+        make_waypoint(-100.0, 0.0, alt_m=100.0),
+    ]
+    config = config_module.defaults()
+    navigator = make_navigator(waypoints, end_action=mission_module.END_REPEAT)
+    navigator.engage()
+    aircraft = SimulatedAircraft(config)
+
+    visited = [0]
+    for _ in range(4000):  # 800 s at 5 Hz: comfortably two laps of the box
+        aircraft.step(navigator)
+        assert navigator.state != nav.STATE_LOITER, "repeat settled into loiter"
+        if navigator.index != visited[-1]:
+            visited.append(navigator.index)
+        if navigator.laps >= 2:
+            break
+
+    assert navigator.laps >= 2, "never completed two laps"
+    assert visited[:8] == [0, 1, 2, 3, 0, 1, 2, 3], (
+        "waypoints out of order: %r" % (visited,))
 
 
 def test_simulated_flight_holds_the_loiter_circle():

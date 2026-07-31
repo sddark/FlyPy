@@ -346,9 +346,9 @@ async def _wait_for_arm_request(rc, gps, current_config, led, portal):
     while True:
         now_ms = _now_ms()
         rc.update(now_ms)
-        # GPS is polled while disarmed only (nav is deferred; the portal
-        # shows fix status and the driver re-sends its boot config as
-        # needed). The armed loop ignores it until the nav part lands.
+        # Polled while disarmed so the portal can show fix status and the
+        # driver can re-send its boot config as needed. The armed loop polls
+        # it too -- that is where nav actually consumes the fixes.
         gps.update(now_ms)
         led.tick(now_ms)
         await portal.check()

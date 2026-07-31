@@ -1000,8 +1000,11 @@ function draw() {
       i ? ctx.lineTo(q.x, q.y) : ctx.moveTo(q.x, q.y);
     }
     ctx.stroke();
-    drawEndActionLeg();
   }
+  // Outside the polyline guard above: a one-waypoint plan draws no legs but
+  // still has an ending, and "return home" from that single point is a real
+  // leg the pilot should see.
+  drawEndActionLeg();
 
   drawHeadingMarker(w / 2, h / 2);
 
@@ -1032,6 +1035,9 @@ function draw() {
 function drawEndActionLeg() {
   var action = document.getElementById('end-action').value;
   if (action !== 'repeat' && action !== 'rth') return;
+  // Repeat closes a loop, so it needs two points to close between; rth only
+  // needs somewhere to leave from. Neither can draw from an empty plan.
+  if (!state.wps.length || (action === 'repeat' && state.wps.length < 2)) return;
   var from = toPx(state.wps[state.wps.length - 1]);
   var to = action === 'repeat' ? toPx(state.wps[0])
                                : {x: canvas.width / 2, y: canvas.height / 2};

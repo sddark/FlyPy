@@ -7,9 +7,10 @@
 # change the flight plan -- a mission either saves exactly as given or the
 # save is rejected with a reason the UI can show.
 #
-# The nav loop that consumes this lands with the GPS part (autonomous mode
-# currently falls back to stabilized -- see main.py); until then the portal
-# is the only reader/writer.
+# The portal writes this; nav.Navigator reads it. main.py re-reads the file
+# at each arm rather than at boot, so a plan saved from the portal flies
+# without a reboot -- which is also why validation has to hold the line here
+# rather than trusting whatever last reached flash.
 
 import os
 
