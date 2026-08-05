@@ -164,10 +164,20 @@ def test_all_four_demands_available():
 
 
 def test_failsafe_outranks_demand_overrides():
-    # The requirement: nothing a rule does may survive failsafe. It is the
-    # only refusal, and it keys on link loss rather than on a mode name so a
-    # future mode cannot re-open the path.
+    # The requirement: nothing a rule does may survive failsafe. It keys on
+    # conditions rather than on mode names so a future mode cannot re-open
+    # the path.
     assert not logic.demands_allowed(True)
+    assert not logic.demands_allowed(True, False)
+
+
+def test_gps_failsafe_also_outranks_demand_overrides():
+    # The second failsafe: losing the position estimate in autonomous levels
+    # the wings and cuts throttle, and a rule must not be able to put that
+    # throttle back. The RC link is fine in this case, which is exactly why
+    # checking link_lost alone was not enough.
+    assert not logic.demands_allowed(False, True)
+    assert not logic.demands_allowed(True, True)
 
 
 def test_demands_allowed_in_every_live_mode():
@@ -175,6 +185,17 @@ def test_demands_allowed_in_every_live_mode():
     # need to duplicate it. A rule wanting its own kill switch reads a
     # spare RC channel (see test_demand_can_fall_back_to_the_stick).
     assert logic.demands_allowed(False)
+    assert logic.demands_allowed(False, False)
+
+
+def test_failsafe_timeout_is_not_assignable():
+    # A rule that could widen the link timeout could postpone the failsafe
+    # that revokes its own demand authority.
+    assert "failsafe_link_timeout_ms" not in logic.assignable_targets(
+        config_module.SCHEMA)
+    rules, errors = logic.compile_source(
+        "failsafe_link_timeout_ms = 5000", config_module.SCHEMA, FREE_PINS)
+    assert not rules and len(errors) == 1
 
 
 def test_demand_can_fall_back_to_the_stick():

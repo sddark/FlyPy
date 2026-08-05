@@ -109,6 +109,52 @@ SCHEMA = {
     # Fix-quality gates before autonomous mode will engage.
     "nav_min_sats": (7.0, 4.0, 20.0, 1.0),
     "nav_max_h_acc_m": (10.0, 1.0, 50.0, 1.0),
+    # --- Automatic landing (mission end_action "land", see nav.py) ---------
+    # Structure follows INAV's fixed-wing landing (docs/Fixed Wing
+    # Landing.md): fly to a point one approach-length back from the
+    # touchdown point along the reciprocal of the landing heading, track the
+    # final leg down a glideslope, then cut the motor and glide in.
+    #
+    # INAV's own sequence has three more phases than this one. It measures
+    # wind in a 30 s loiter and picks the headwind direction of up to four;
+    # here the direction is this parameter, set for the day's wind before
+    # flight. It also has a flare phase, which upstream documents as
+    # LIDAR/rangefinder-dependent -- without one INAV likewise ends at the
+    # glide, which is exactly what this airframe does.
+    #
+    # Course flown on final approach, degrees. Set it INTO WIND on the day:
+    # nothing here estimates wind, and a downwind approach lands long and
+    # fast. 0 = touching down heading north.
+    "nav_land_heading_deg": (0.0, 0.0, 359.0, 1.0),
+    # Distance from touchdown back to the start of the final leg. INAV's
+    # nav_fw_land_approach_length default is 35000 cm.
+    "nav_land_approach_length_m": (350.0, 50.0, 1000.0, 10.0),
+    # Height above home to fly the approach leg at, before the glideslope
+    # starts down.
+    "nav_land_approach_alt_m": (50.0, 10.0, 200.0, 5.0),
+    # Height above home at which the motor stops and the glide begins.
+    # INAV's nav_fw_land_glide_alt default is 200 cm -- which assumes a
+    # barometer. This build has GPS altitude only, whose vertical accuracy
+    # (gps.v_acc_m) is typically 3-10 m, so a 2 m trigger sits below the
+    # noise floor and would fire late or not at all. Defaulted an order of
+    # magnitude higher so the decision is made on a figure the sensor can
+    # actually resolve; the cost is a longer powerless glide.
+    "nav_land_glide_alt_m": (20.0, 5.0, 60.0, 1.0),
+    # Nose-down attitude held through the glide, degrees. This sets where
+    # the aircraft actually touches down, and it matters far more here than
+    # upstream: INAV defaults nav_fw_land_glide_pitch to 0 (hold level and
+    # sink), which is fine when the glide only starts 2 m up, but this build
+    # starts it at nav_land_glide_alt_m because GPS altitude cannot resolve
+    # 2 m -- so the glide is a long float, and its length is set by this.
+    #
+    # Float from a 20 m glide start at 15 m/s, simulated in test_nav.py:
+    #    5 deg -> 1.3 m/s sink, 225 m float, touchdown ~200 m past home
+    #   10 deg -> 2.6 m/s sink, 111 m float, touchdown  ~85 m past home
+    #   15 deg -> 3.9 m/s sink,  75 m float, touchdown  ~50 m past home
+    # Steeper lands nearer the mark and arrives harder. 10 is the
+    # compromise; PLAN FOR THE FIELD TO BE CLEAR WELL BEYOND THE TOUCHDOWN
+    # POINT, because there is no flare and nothing here shortens the float.
+    "nav_land_glide_pitch_deg": (10.0, 0.0, 30.0, 1.0),
     # WiFi AP shown while disarmed
     "wifi_ssid_suffix": ("pico-wing", None, None, None),
     "wifi_password": ("picowing", None, None, None),

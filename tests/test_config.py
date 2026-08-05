@@ -8,6 +8,41 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "firmware"))
 
 import config as config_module
 
+_SERVER_SOURCE = os.path.join(
+    os.path.dirname(__file__), "..", "firmware", "server.py")
+
+
+def _config_group_names():
+    # server.py imports `network`, so it cannot be imported off-target --
+    # read _CONFIG_GROUPS out of the source instead. Worth the awkwardness:
+    # the config page renders only what those groups name, so a parameter
+    # added to SCHEMA and forgotten here is invisible in the portal and
+    # silently untunable, with nothing anywhere to say so.
+    import ast
+
+    with open(_SERVER_SOURCE) as handle:
+        tree = ast.parse(handle.read())
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(getattr(t, "id", None) == "_CONFIG_GROUPS" for t in node.targets):
+            continue
+        names = set()
+        for _label, entries in ast.literal_eval(node.value):
+            names.update(entries)
+        return names
+    raise AssertionError("_CONFIG_GROUPS not found in server.py")
+
+
+def test_every_schema_parameter_is_on_the_config_page():
+    missing = sorted(set(config_module.SCHEMA) - _config_group_names())
+    assert not missing, "not shown on the config page: %s" % ", ".join(missing)
+
+
+def test_config_page_names_no_parameter_that_does_not_exist():
+    unknown = sorted(_config_group_names() - set(config_module.SCHEMA))
+    assert not unknown, "config page names unknown parameters: %s" % ", ".join(unknown)
+
 
 def test_validate_without_base_uses_defaults():
     assert config_module.validate({}) == config_module.defaults()

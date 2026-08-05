@@ -47,6 +47,10 @@ EXCLUDED_TARGETS = (
     "channel_roll", "channel_pitch", "channel_throttle",
     "channel_yaw", "channel_arm", "channel_mode",
     "wifi_ssid_suffix", "wifi_password",
+    # A rule must not be able to move the line it is itself judged against:
+    # widening this delays the failsafe that revokes the rule's own demand
+    # authority, which is the one guarantee demands_allowed() exists to make.
+    "failsafe_link_timeout_ms",
 )
 
 PWM_MIN_US = 500
@@ -121,7 +125,7 @@ INPUT_CATALOGUE = (
         ("gps_age_ms", 140, "since last fix, -1 if none"),
     )),
     ("Navigation", (
-        ("nav_state", "run", "idle / run / rth / loiter"),
+        ("nav_state", "run", "idle / run / rth / loiter / land_*"),
         ("wp_index", 4, "active waypoint, 1-based"),
         ("wp_total", 5, "waypoints in mission"),
         ("wp_distance_m", 240.0, "to active waypoint"),
@@ -192,15 +196,22 @@ class Rule:
         self.sink = None  # the dict this rule writes into; set by activate()
 
 
-def demands_allowed(link_lost):
+def demands_allowed(link_lost, gps_failsafe=False):
     # The single definition of when a rule may drive the flight demands.
     # Lives here, not inline in the flight loop, so the rule that matters
     # most can be unit-tested off-target.
     #
     # FAILSAFE OUTRANKS EVERYTHING, and it is the only thing that does.
-    # Keyed on link_lost rather than on a mode name so that adding or
+    # Keyed on conditions rather than on mode names so that adding or
     # renaming a mode later cannot quietly re-open the path that lets a rule
     # restore throttle after failsafe cut it.
+    #
+    # There are two failsafes, and both revoke demand authority. link_lost is
+    # the RC one. gps_failsafe is the autonomous one: losing the position
+    # estimate levels the wings and cuts throttle (the owner's recorded
+    # decision), and for a while a rule could put that throttle straight
+    # back, because only the RC failsafe was checked here. A cut that any
+    # rule can undo is not a failsafe.
     #
     # Manual is deliberately NOT excluded. It was, briefly, on the theory
     # that it should stay a guaranteed stick-only escape -- but failsafe
@@ -210,7 +221,7 @@ def demands_allowed(link_lost):
     # a switch position to duplicate a guarantee that already existed. A
     # rule that wants its own kill switch can read any spare RC channel:
     #     throttle_demand = 0.4 if ch7 > 1500 else throttle
-    return not link_lost
+    return not (link_lost or gps_failsafe)
 
 
 def assignable_targets(schema):

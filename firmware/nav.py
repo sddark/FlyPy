@@ -35,6 +35,16 @@ STATE_IDLE = "idle"
 STATE_RUN = "run"
 STATE_RTH = "rth"
 STATE_LOITER = "loiter"
+# Automatic landing, mission end_action "land". Follows INAV's fixed-wing
+# landing sequence (docs/Fixed Wing Landing.md) with its sensor-dependent
+# phases removed: upstream measures wind in a 30 s loiter before choosing
+# among up to four approach headings (we use the configured one) and adds a
+# flare below nav_fw_land_flare_alt, which upstream documents as
+# LIDAR/rangefinder-dependent -- without one INAV also ends at the glide.
+STATE_LAND_APPROACH = "land_approach"  # fly to the start of the final leg
+STATE_LAND_FINAL = "land_final"        # track the leg down the glideslope
+STATE_LAND_GLIDE = "land_glide"        # motor off, fixed pitch, hold course
+_LANDING_STATES = (STATE_LAND_APPROACH, STATE_LAND_FINAL, STATE_LAND_GLIDE)
 
 # Angle by which the loiter target leads the aircraft around the circle.
 # Large enough to keep the nose pulling around the turn, small enough not
@@ -57,6 +67,16 @@ def local_offsets(lat_ref, lon_ref, lat, lon):
     north = (lat - lat_ref) * _M_PER_DEG_LAT
     east = (lon - lon_ref) * _M_PER_DEG_LAT * cos(radians(lat_ref))
     return north, east
+
+
+def offset_to_latlon(lat_ref, lon_ref, north, east):
+    # Inverse of local_offsets, same equirectangular approximation. The
+    # landing geometry is naturally expressed in metres from the touchdown
+    # point, but _target()/_apply_demands work in lat/lon, so the synthesized
+    # approach point has to come back the other way.
+    lat = lat_ref + north / _M_PER_DEG_LAT
+    lon = lon_ref + east / (_M_PER_DEG_LAT * cos(radians(lat_ref)))
+    return lat, lon
 
 
 def bearing_deg(north, east):
@@ -126,6 +146,11 @@ class Navigator:
         self._min_ground_speed = config["nav_min_ground_speed_ms"]
         self._min_sats = int(config["nav_min_sats"])
         self._max_h_acc = config["nav_max_h_acc_m"]
+        self._land_heading = config["nav_land_heading_deg"]
+        self._land_approach_length = config["nav_land_approach_length_m"]
+        self._land_approach_alt = config["nav_land_approach_alt_m"]
+        self._land_glide_alt = config["nav_land_glide_alt_m"]
+        self._land_glide_pitch = config["nav_land_glide_pitch_deg"]
         # The cascade converts pitch_stick via pitch_angle_max_deg, so nav
         # can never command beyond that however the climb/dive limits are
         # set -- clamp here rather than let the demand be silently clipped.
@@ -133,11 +158,16 @@ class Navigator:
         self._rate_yaw = config["rate_yaw_dps"]
 
     def set_mission(self, mission):
-        # The ending travels with the plan (see mission.py), not with config.
+        # The ending and the altitude datum both travel with the plan (see
+        # mission.py), not with config.
         self.waypoints = mission.get("waypoints", []) if mission else []
         self.end_action = (
             mission.get("end_action", mission_module.DEFAULT_END_ACTION)
             if mission else mission_module.DEFAULT_END_ACTION
+        )
+        self.alt_frame = (
+            mission.get("alt_frame", mission_module.DEFAULT_ALT_FRAME)
+            if mission else mission_module.DEFAULT_ALT_FRAME
         )
         self.laps = 0
 
@@ -209,10 +239,22 @@ class Navigator:
         return previous["lat"], previous["lon"]
 
     def _target(self):
+        # Altitude is returned as MSL in every case, because that is the only
+        # thing _apply_demands can compare against (gps.alt_m is the GPS's own
+        # MSL figure). Resolving the mission's datum here, once, is what keeps
+        # every consumer downstream working in a single unit.
         if self.state == STATE_RTH:
             return self.home[0], self.home[1], self.home[2]
         waypoint = self.waypoints[self.index]
-        return waypoint["lat"], waypoint["lon"], waypoint["alt_m"]
+        return waypoint["lat"], waypoint["lon"], self.target_alt_msl(waypoint)
+
+    def target_alt_msl(self, waypoint):
+        # A relative plan is anchored to the home altitude captured at arm,
+        # so the same plan flown at a different field flies at the same
+        # height over that field rather than at a fixed sea-level altitude.
+        if self.alt_frame == mission_module.ALT_FRAME_AMSL or self.home is None:
+            return waypoint["alt_m"]
+        return self.home[2] + waypoint["alt_m"]
 
     def update(self, gps):
         # Recompute only on a fresh NAV-PVT; demands are held between fixes.
@@ -221,6 +263,10 @@ class Navigator:
         if gps.last_pvt_ms == self._last_pvt_ms:
             return
         self._last_pvt_ms = gps.last_pvt_ms
+
+        if self.state in _LANDING_STATES:
+            self._update_landing(gps)
+            return
 
         target_lat, target_lon, target_alt = self._target()
         pos_n, pos_e = local_offsets(
@@ -266,22 +312,30 @@ class Navigator:
         if self.end_action == mission_module.END_REPEAT:
             self.index = 0          # _leg_start now tracks from the last WP
             return True
-        self.state = (
-            STATE_RTH if self.end_action == mission_module.END_RTH
-            else STATE_LOITER
-        )
+        if self.end_action == mission_module.END_RTH:
+            self.state = STATE_RTH
+        elif self.end_action == mission_module.END_LAND:
+            self.state = STATE_LAND_APPROACH
+        else:
+            self.state = STATE_LOITER
         return True
 
     def _track_course(
-        self, pos_n, pos_e, target_n, target_e, to_target_n, to_target_e, range_m
+        self, pos_n, pos_e, target_n, target_e, to_target_n, to_target_e, range_m,
+        start_n=None, start_e=None,
     ):
         # INAV's virtual-target idea in its simplest honest form: chase the
         # bearing to the waypoint, biased to rejoin the leg's track line.
+        #
+        # start_n/start_e override the leg start for a leg that isn't between
+        # two mission waypoints -- the landing final, which runs from a
+        # synthesized approach point that was never in the waypoint list.
         direct = bearing_deg(to_target_n, to_target_e)
-        start_lat, start_lon = self._leg_start()
-        start_n, start_e = local_offsets(
-            self.home[0], self.home[1], start_lat, start_lon
-        )
+        if start_n is None:
+            start_lat, start_lon = self._leg_start()
+            start_n, start_e = local_offsets(
+                self.home[0], self.home[1], start_lat, start_lon
+            )
         offset = cross_track_m(start_n, start_e, target_n, target_e, pos_n, pos_e)
         correction = -offset * self._xtrack_p
         if correction > self._xtrack_limit:
@@ -293,6 +347,83 @@ class Navigator:
             return direct
         track = bearing_deg(target_n - start_n, target_e - start_e)
         return (track + correction) % 360.0
+
+    # --- automatic landing ------------------------------------------------
+
+    def land_entry_offsets(self):
+        # Start of the final leg: one approach length back from touchdown
+        # along the RECIPROCAL of the landing heading, so that flying entry
+        # -> touchdown means flying on the configured heading. Touchdown is
+        # home, which is the origin of the local frame, so the entry point
+        # is just the reverse-heading vector.
+        heading = radians(self._land_heading)
+        return (-self._land_approach_length * cos(heading),
+                -self._land_approach_length * sin(heading))
+
+    def land_target_alt_rel(self, range_to_touchdown_m):
+        # Linear glideslope: approach altitude at the start of the final
+        # leg, home altitude at touchdown. Clamped at the top so that being
+        # beyond the entry point (a long or overshooting approach) holds the
+        # approach altitude rather than commanding a climb above it.
+        if self._land_approach_length <= 0.0:
+            return 0.0
+        fraction = range_to_touchdown_m / self._land_approach_length
+        if fraction > 1.0:
+            fraction = 1.0
+        return self._land_approach_alt * fraction
+
+    def _update_landing(self, gps):
+        pos_n, pos_e = local_offsets(
+            self.home[0], self.home[1], gps.lat_deg, gps.lon_deg
+        )
+        entry_n, entry_e = self.land_entry_offsets()
+
+        if self.state == STATE_LAND_APPROACH:
+            to_entry_n = entry_n - pos_n
+            to_entry_e = entry_e - pos_e
+            if distance_m(to_entry_n, to_entry_e) > self._wp_radius:
+                # Fly to the entry point at approach altitude, so the
+                # glideslope starts from a known height rather than from
+                # wherever the mission happened to leave off.
+                self._apply_demands(
+                    gps,
+                    bearing_deg(to_entry_n, to_entry_e),
+                    self.home[2] + self._land_approach_alt,
+                )
+                return
+            self.state = STATE_LAND_FINAL
+
+        # Deliberately NOT checked during the approach: down there the
+        # aircraft is still being flown up to approach altitude, and a
+        # mission that happened to end low would otherwise cut the motor
+        # immediately and glide off on the landing heading from wherever it
+        # was. INAV likewise only glides once established on final.
+        if gps.alt_m - self.home[2] <= self._land_glide_alt:
+            self.state = STATE_LAND_GLIDE
+
+        if self.state == STATE_LAND_GLIDE:
+            # Motor off, nose fixed slightly down, holding the landing
+            # heading. No altitude loop -- there is nothing left to hold
+            # altitude with, and chasing a glideslope on GPS altitude this
+            # close to the ground would only inject noise into the pitch.
+            # Terminal: no path back out re-arms the motor.
+            self._steer(gps, self._land_heading)
+            self.pitch_stick = (
+                -self._land_glide_pitch / self._pitch_scale
+                if self._pitch_scale else 0.0
+            )
+            self.throttle = 0.0
+            return
+
+        # Final: track the entry -> touchdown line with the same cross-track
+        # correction the mission legs use, descending down the glideslope.
+        range_m = distance_m(-pos_n, -pos_e)
+        course = self._track_course(
+            pos_n, pos_e, 0.0, 0.0, -pos_n, -pos_e, range_m, entry_n, entry_e
+        )
+        self._apply_demands(
+            gps, course, self.home[2] + self.land_target_alt_rel(range_m)
+        )
 
     def _loiter_course(self, pos_n, pos_e, center_n, center_e):
         radial_n = pos_n - center_n
@@ -308,10 +439,12 @@ class Navigator:
         target_e = center_e + self._loiter_radius * sin(angle)
         return bearing_deg(target_n - pos_n, target_e - pos_e)
 
-    def _apply_demands(self, gps, desired_course, target_alt):
+    def _steer(self, gps, desired_course):
         # Course error -> yaw rate. This is the deviation from INAV noted at
         # the top: no roll actuator exists, so the turn demand rides the
-        # yaw path instead of a bank angle.
+        # yaw path instead of a bank angle. Split out from _apply_demands
+        # because the glide steers without wanting any of the altitude or
+        # throttle logic that follows it.
         course_error = wrap180(desired_course - gps.course_deg)
         yaw_rate = course_error * self._heading_p
         if yaw_rate > self._rate_yaw:
@@ -319,6 +452,9 @@ class Navigator:
         elif yaw_rate < -self._rate_yaw:
             yaw_rate = -self._rate_yaw
         self.yaw_stick = yaw_rate / self._rate_yaw if self._rate_yaw else 0.0
+
+    def _apply_demands(self, gps, desired_course, target_alt):
+        self._steer(gps, desired_course)
 
         # Altitude error -> pitch angle, with INAV's asymmetric climb/dive
         # limits, then normalized into the cascade's stick units.

@@ -90,6 +90,28 @@ _NAV_GPS_TIMEOUT_MS = 5000
 _PORTAL_RESTART_DELAY_MS = 250
 _PORTAL_MAX_FAILURES = 5
 
+# Hardware watchdog. The armed loop feeds it every iteration (250 Hz) and the
+# disarmed loop every poll (10 Hz), so it fires only if the asyncio scheduler
+# itself stops advancing -- the one failure the try/finally below cannot cover,
+# because a wedged loop never reaches a finally at all and PWM is hardware:
+# the motor would hold its last commanded throttle indefinitely. A reset lands
+# in the portal with outputs safe and, because the arm switch is still ON and
+# arm_switch_seen_off starts False, deliberately does NOT re-arm. In flight
+# that means a dead-stick glide -- worse than ArduPilot, which preserves state
+# across a watchdog reset and keeps flying, and better than a motor stuck at
+# cruise. INAV carries no watchdog at all.
+#
+# 4 s: comfortably above the AP-start path (bounded at 5 s but run before the
+# watchdog exists) and any plausible microdot chunked send, while still
+# bounding a lockup to well under the time it takes to lose sight of a plane.
+_WATCHDOG_TIMEOUT_MS = 4000
+
+# After the armed loop dies of an exception the arm switch is usually still
+# ON. Re-arming straight into the same fault would spin crash -> portal ->
+# crash as fast as the IMU can fail, so recovery demands the switch be
+# cycled OFF first -- the same gate rc.py already applies at boot.
+_FLIGHT_LOOP_RESTART_DELAY_MS = 500
+
 # INAV flight/pid.h scale constants (fixed-wing PIFF controller).
 _PID_P_MULTIPLIER = 31.0
 _PID_I_MULTIPLIER = 4.0
@@ -285,6 +307,28 @@ def _arm_requested(rc, config, now_ms):
     )
 
 
+class _Watchdog:
+    # Thin wrapper so a build without machine.WDT (or a timeout the port
+    # refuses) degrades to a no-op with a printed reason rather than taking
+    # the firmware down at boot -- the portal has to come up regardless.
+    # Created once, at boot: an RP2040 watchdog cannot be stopped again, so
+    # there is no arm/disarm scoping to be had and every loop from here on
+    # has to feed it anyway.
+    def __init__(self, timeout_ms):
+        self._wdt = None
+        try:
+            from machine import WDT
+
+            self._wdt = WDT(timeout=timeout_ms)
+            print("watchdog armed, %d ms" % timeout_ms)
+        except (ImportError, ValueError, OSError) as error:
+            print("watchdog unavailable:", repr(error))
+
+    def feed(self):
+        if self._wdt is not None:
+            self._wdt.feed()
+
+
 class _Portal:
     # Owns the web-server task. An exception inside a bare
     # create_task(app.start_server(...)) sits silently in the task object
@@ -341,9 +385,10 @@ class _Portal:
         await self._collect("shutdown")
 
 
-async def _wait_for_arm_request(rc, gps, current_config, led, portal):
+async def _wait_for_arm_request(rc, gps, current_config, led, portal, watchdog):
     led.set_mode("blink_slow")
     while True:
+        watchdog.feed()
         now_ms = _now_ms()
         rc.update(now_ms)
         # Polled while disarmed so the portal can show fix status and the
@@ -436,7 +481,7 @@ def _capture_home(navigator, gps, config):
     return True
 
 
-async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux):
+async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux, watchdog):
     # Defense in depth: nothing should be driving outputs while disarmed
     # (the portal's bench-test pages that once did are gone), but IMU init +
     # gyro calibration below take the better part of a second, so start from
@@ -454,6 +499,7 @@ async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux):
         print("IMU init failed, refusing to arm:", error)
         led.set_mode("blink_fast")
         while rc.arm_switch_on:
+            watchdog.feed()
             now_ms = _now_ms()
             rc.update(now_ms)
             led.tick(now_ms)
@@ -495,6 +541,7 @@ async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux):
     last_us = time.ticks_us()
     try:
         while rc.arm_switch_on:
+            watchdog.feed()
             now_ms = _now_ms()
             rc.update(now_ms)
             # Cheap at a 5 Hz fix rate: most iterations read an empty UART.
@@ -588,7 +635,12 @@ async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux):
             # rules still evaluate, so their values stay visible on the
             # status page -- only the application is skipped. The rule for
             # when they may apply lives in logic.demands_allowed().
-            if logic_engine.demands and logic_module.demands_allowed(link_lost):
+            # "nav_lost" is set by _autonomous_demands when the position
+            # estimate goes stale, and it has already zeroed throttle: this
+            # is what stops a rule handing that throttle straight back.
+            if logic_engine.demands and logic_module.demands_allowed(
+                link_lost, mode == "nav_lost"
+            ):
                 throttle = logic_engine.demands.get("throttle_demand", throttle)
                 pitch_stick = logic_engine.demands.get("pitch_demand", pitch_stick)
                 yaw_stick = logic_engine.demands.get("yaw_demand", yaw_stick)
@@ -676,6 +728,7 @@ async def main():
     rc = CrsfReceiver(config_module.defaults())
     gps = UbxGps()
     gc.collect()
+    watchdog = _Watchdog(_WATCHDOG_TIMEOUT_MS)
     active_config = config_module.load()
     rc.set_channel_map(active_config)
     outputs = FlightOutputs(active_config)
@@ -704,15 +757,42 @@ async def main():
                                  logic_engine, free_pins)
 
     while True:
-        access_point = server.start_access_point(active_config)
+        access_point = server.start_access_point(active_config, watchdog.feed)
         portal = _Portal(make_app)
         try:
-            await _wait_for_arm_request(rc, gps, current_config, led, portal)
+            await _wait_for_arm_request(rc, gps, current_config, led, portal,
+                                        watchdog)
         finally:
             await portal.stop()
             server.stop_access_point(access_point)
-        await _run_flight_loop(rc, gps, active_config, outputs, led,
-                               logic_engine, aux)
+        try:
+            await _run_flight_loop(rc, gps, active_config, outputs, led,
+                                   logic_engine, aux, watchdog)
+        except Exception as error:
+            # The loop's own try/finally has already forced the outputs safe;
+            # what it cannot do is get us back somewhere useful. Without this
+            # the exception unwound out of main(), asyncio.run() returned, and
+            # the board sat dead -- no portal, no way to re-arm, no way to
+            # read the error off a plane in a field. A single transient I2C
+            # NAK from the IMU was enough to do it.
+            print("flight loop crashed:", repr(error))
+            _print_traceback(error)
+            # Demand the arm switch be cycled OFF before re-arming, so a
+            # persistent fault cannot spin crash -> portal -> crash.
+            rc.arm_switch_seen_off = False
+            watchdog.feed()
+            await asyncio.sleep_ms(_FLIGHT_LOOP_RESTART_DELAY_MS)
+
+
+def _print_traceback(error):
+    # MicroPython puts this on sys, CPython on traceback; neither is worth
+    # failing the recovery path over if the print itself goes wrong.
+    try:
+        import sys
+
+        sys.print_exception(error)
+    except (ImportError, AttributeError):
+        pass
 
 
 def _now_ms():

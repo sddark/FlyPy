@@ -67,6 +67,11 @@ _CONFIG_GROUPS = (
         "nav_min_sats", "nav_max_h_acc_m", "nav_min_ground_speed_ms",
         "nav_max_safe_distance_m",
     )),
+    ("Navigation — automatic landing", (
+        "nav_land_heading_deg", "nav_land_approach_length_m",
+        "nav_land_approach_alt_m", "nav_land_glide_alt_m",
+        "nav_land_glide_pitch_deg",
+    )),
     ("WiFi", (
         "wifi_ssid_suffix", "wifi_password",
     )),
@@ -610,9 +615,14 @@ def _config_body_chunks(current_config, message=""):
 # you work in metres from a reference position (the module's own GPS fix
 # where available), because that's the frame of reference you actually have
 # standing in a field. Latitude/longitude are derived, displayed, and only
-# materialize as lat/lon in the POST body; the flight controller still
-# stores and validates exactly the same {"waypoints":[{lat,lon,alt_m}]}
-# shape as before, so mission.py is untouched by the UI change.
+# materialize as lat/lon in the POST body; the flight controller stores and
+# validates {"waypoints":[{lat,lon,alt_m}], "end_action":.., "alt_frame":..}.
+#
+# alt_frame is mission-wide rather than per-waypoint (which is what INAV and
+# ArduPilot both do) because those stacks need per-leg datums to mix terrain
+# following with absolute altitudes, and this airframe carries no terrain
+# data to follow. Per-waypoint stays a compatible extension: a waypoint key
+# would simply default to the mission's.
 #
 # The reference position is fetched ONCE on load, plus on an explicit
 # button press -- deliberately not polled. Fast polling from portal pages
@@ -840,6 +850,13 @@ _MISSION_MARKUP = (
     '<span id="heading-text">heading &mdash;</span></span>'
     '</div>'
     '<h2>Waypoints</h2>'
+    '<div class="toolbar">'
+    '<select id="alt-frame" onchange="altFrameChanged()">'
+    '<option value="rel">Altitudes are above the launch point</option>'
+    '<option value="amsl">Altitudes are above sea level</option>'
+    '</select>'
+    '</div>'
+    '<p class="sub" id="alt-frame-note"></p>'
     '<div class="wp-strip" id="strip"></div>'
     '<h2>After the last waypoint</h2>'
     '<div class="toolbar">'
@@ -847,7 +864,10 @@ _MISSION_MARKUP = (
     '<option value="loiter">Loiter over the last waypoint</option>'
     '<option value="rth">Return to home, then loiter</option>'
     '<option value="repeat">Fly back to waypoint 1 and repeat</option>'
+    '<option value="land">Land at the launch point</option>'
     '</select>'
+    '</div>'
+    '<p class="sub" id="end-action-note"></p>'
     '</div>'
     '<div class="toolbar">'
     '<button type="button" id="save-btn" onclick="save()">Save mission</button>'
@@ -875,6 +895,16 @@ _MISSION_SCRIPT = r"""<script>
 var M_PER_DEG = 111320;
 var MAX_WP = 20;
 var DEFAULT_ALT = 100;
+// Must match mission._ALT_RANGE_BY_FRAME. The datum is picked once for the
+// whole plan; "rel" means metres above the altitude captured when you arm,
+// which is what you actually mean standing in a field, and is what both
+// INAV and ArduPilot default their waypoints to.
+var ALT_RANGE = {rel: [0, 500], amsl: [-100, 5000]};
+function altFrame() {
+  var el = document.getElementById('alt-frame');
+  return el ? el.value : 'rel';
+}
+function altRange() { return ALT_RANGE[altFrame()] || ALT_RANGE.rel; }
 var state = {wps: [], span: 400, sel: -1, drag: -1, home: null, source: 'none'};
 // Which way the aircraft is pointing, for the centre chevron. Compass when
 // the QMC5883 answers (valid standing still), otherwise GPS course over
@@ -1034,9 +1064,9 @@ function draw() {
 // 1, rth heads for the reference position at the centre.
 function drawEndActionLeg() {
   var action = document.getElementById('end-action').value;
-  if (action !== 'repeat' && action !== 'rth') return;
-  // Repeat closes a loop, so it needs two points to close between; rth only
-  // needs somewhere to leave from. Neither can draw from an empty plan.
+  if (action !== 'repeat' && action !== 'rth' && action !== 'land') return;
+  // Repeat closes a loop, so it needs two points to close between; rth and
+  // land only need somewhere to leave from. None can draw from an empty plan.
   if (!state.wps.length || (action === 'repeat' && state.wps.length < 2)) return;
   var from = toPx(state.wps[state.wps.length - 1]);
   var to = action === 'repeat' ? toPx(state.wps[0])
@@ -1051,13 +1081,41 @@ function drawEndActionLeg() {
   ctx.setLineDash([]);
 }
 
+// Switching the datum REINTERPRETS the numbers, it does not convert them:
+// the editor knows the reference latitude/longitude but never its altitude,
+// so it cannot turn 100 m over the field into an MSL figure. Say so, because
+// silently leaving "100" in place while changing what it means is exactly
+// the ambiguity this selector exists to remove.
+function altFrameChanged() {
+  var rel = altFrame() === 'rel';
+  document.getElementById('alt-frame-note').textContent = rel
+    ? 'Each waypoint’s height above wherever the plane is armed.'
+    : 'Absolute altitudes. Changing this does not convert the numbers below'
+      + ' — check every waypoint.';
+  // Re-clamp into the new range before re-rendering, so a value the new
+  // datum cannot hold is corrected here rather than rejected on save.
+  var r = altRange();
+  for (var i = 0; i < state.wps.length; i++) {
+    state.wps[i].alt = Math.max(r[0], Math.min(r[1], state.wps[i].alt));
+  }
+  refresh();
+}
+
 function endActionChanged() {
-  if (document.getElementById('end-action').value === 'repeat'
-      && state.wps.length < 2) {
+  var action = document.getElementById('end-action').value;
+  if (action === 'repeat' && state.wps.length < 2) {
     setMsg('Repeat needs at least 2 waypoints.', false);
   } else {
     setMsg('', true);
   }
+  // The approach direction is a config-page parameter, not part of the
+  // plan, and it is the one setting that has to change with the day's
+  // wind -- so say so here, where landing is actually being chosen.
+  document.getElementById('end-action-note').textContent = action === 'land'
+    ? 'Flies an approach into the launch point and glides in with the motor'
+      + ' off. Set “nav_land_heading_deg” on the Config page to the'
+      + ' direction you want it landing — into wind.'
+    : '';
   draw();
 }
 
@@ -1120,7 +1178,8 @@ function renderStrip() {
         + '<span class="idx">' + (i + 1) + '</span>'
         + '<span class="coords">' + coords + '</span>'
         + '<span class="alt"><input type="number" value="' + wp.alt
-        + '" min="0" max="500" data-alt="' + i + '"> m</span>'
+        + '" min="' + altRange()[0] + '" max="' + altRange()[1]
+        + '" data-alt="' + i + '"> m</span>'
         + '<button type="button" class="btn-quiet" data-remove="' + i
         + '" aria-label="Delete waypoint ' + (i + 1) + '">&times;</button>'
         + '</div>';
@@ -1159,7 +1218,8 @@ function selectWaypoint(i) {
   draw();
 }
 function setAlt(i, v, field) {
-  var alt = Math.max(0, Math.min(500, parseFloat(v) || 0));
+  var r = altRange();
+  var alt = Math.max(r[0], Math.min(r[1], parseFloat(v) || 0));
   state.wps[i].alt = alt;
   // Reflect clamping in place rather than re-rendering the strip, for the
   // same reason as above -- altitude doesn't affect the plot or the row
@@ -1374,6 +1434,16 @@ async function loadMission() {
   if (stored.end_action) {
     document.getElementById('end-action').value = stored.end_action;
   }
+  // Set the datum BEFORE refresh() so the altitude inputs render with the
+  // right bounds first time.
+  if (stored.alt_frame) {
+    document.getElementById('alt-frame').value = stored.alt_frame;
+  }
+  altFrameChanged();
+  // Both notes are rendered by their change handlers, so they have to be
+  // run once on load or a stored plan shows its selector without the
+  // explanation that goes with it.
+  endActionChanged();
   if (stored.waypoints.length) {
     setMsg(stored.waypoints.length + ' waypoints loaded.', true);
   }
@@ -1387,7 +1457,11 @@ async function save() {
     setMsg('Repeat needs at least 2 waypoints.', false);
     return;
   }
-  var mission = {waypoints: state.wps.map(toLatLon), end_action: endAction};
+  var mission = {
+    waypoints: state.wps.map(toLatLon),
+    end_action: endAction,
+    alt_frame: altFrame()
+  };
   try {
     var r = await fetch('/mission', {
       method: 'POST',
@@ -1500,24 +1574,31 @@ _AP_START_TIMEOUT_MS = 5000
 _AP_POLL_MS = 50
 
 
-def _activate_access_point(ap, ssid, password):
+def _activate_access_point(ap, ssid, password, feed=None):
     ap.active(False)
     ap.config(ssid=ssid, password=password)
     ap.active(True)
     # Bounded wait instead of `while not ap.active(): pass` -- if the AP
     # never comes up, an untimed spin is an unrecoverable silent hang.
+    #
+    # feed: the caller's watchdog, because this is the one blocking stretch
+    # in the firmware that can outlast the watchdog timeout (5 s bound
+    # against a 4 s window). It is a plain callback rather than a WDT
+    # instance so this module keeps knowing nothing about machine.WDT.
     for _ in range(_AP_START_TIMEOUT_MS // _AP_POLL_MS):
+        if feed is not None:
+            feed()
         if ap.active():
             return
         time.sleep_ms(_AP_POLL_MS)
     raise OSError("AP failed to start")
 
 
-def start_access_point(config):
+def start_access_point(config, feed=None):
     ap = network.WLAN(network.AP_IF)
     ssid = "pico-wing-" + config["wifi_ssid_suffix"]
     try:
-        _activate_access_point(ap, ssid, config["wifi_password"])
+        _activate_access_point(ap, ssid, config["wifi_password"], feed)
     except (OSError, ValueError, RuntimeError) as error:
         # Persisted credentials the driver rejects (or an AP that never came
         # up) must not brick the portal -- config.validate() screens new
@@ -1526,7 +1607,9 @@ def start_access_point(config):
         ssid = "pico-wing-" + config_module.SCHEMA["wifi_ssid_suffix"][0]
         print("AP start failed (", error, "); retrying with default credentials")
         try:
-            _activate_access_point(ap, ssid, config_module.SCHEMA["wifi_password"][0])
+            _activate_access_point(
+                ap, ssid, config_module.SCHEMA["wifi_password"][0], feed
+            )
         except (OSError, ValueError, RuntimeError) as retry_error:
             # Even the defaults failed: the CYW43 radio itself is wedged. A
             # full reboot reinitializes it via the cold-boot path (the one

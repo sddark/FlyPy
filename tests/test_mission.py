@@ -19,7 +19,10 @@ def _raises_value_error(raw):
 
 def test_empty_mission_is_valid():
     assert mission.validate({"waypoints": []}) == {
-        "waypoints": [], "end_action": mission.DEFAULT_END_ACTION}
+        "waypoints": [],
+        "end_action": mission.DEFAULT_END_ACTION,
+        "alt_frame": mission.DEFAULT_ALT_FRAME,
+    }
 
 
 def test_valid_mission_round_trips_with_floats():
@@ -34,6 +37,7 @@ def test_valid_mission_round_trips_with_floats():
             {"lat": 51.501, "lon": -0.121, "alt_m": 120.5},
         ],
         "end_action": mission.DEFAULT_END_ACTION,
+        "alt_frame": mission.DEFAULT_ALT_FRAME,
     }
 
 
@@ -103,7 +107,7 @@ def test_missing_end_action_defaults_rather_than_rejecting():
 
 def test_rejects_unknown_end_action():
     assert _raises_value_error(
-        {"waypoints": _two_waypoints(), "end_action": "land"})
+        {"waypoints": _two_waypoints(), "end_action": "ditch"})
     assert _raises_value_error(
         {"waypoints": _two_waypoints(), "end_action": ""})
     assert _raises_value_error(
@@ -120,6 +124,49 @@ def test_repeat_needs_at_least_two_waypoints():
         {"waypoints": [], "end_action": mission.END_REPEAT})
     assert mission.validate(
         {"waypoints": _two_waypoints(), "end_action": mission.END_REPEAT})
+
+
+def test_every_alt_frame_round_trips():
+    for frame in mission.ALT_FRAMES:
+        validated = mission.validate(
+            {"waypoints": _two_waypoints(), "alt_frame": frame}
+        )
+        assert validated["alt_frame"] == frame
+
+
+def test_missing_alt_frame_defaults_to_relative():
+    # The datum a mission.json written before alt_frame existed gets. It must
+    # be the relative one: those plans were drawn in an editor defaulting to
+    # 100 m and capped at 500, i.e. as height over the field, even though the
+    # old nav code went on to read them as MSL.
+    validated = mission.validate({"waypoints": _two_waypoints()})
+    assert validated["alt_frame"] == mission.ALT_FRAME_REL
+    assert mission.DEFAULT_ALT_FRAME == mission.ALT_FRAME_REL
+
+
+def test_rejects_unknown_alt_frame():
+    for bad in ("agl", "", None, 0):
+        assert _raises_value_error(
+            {"waypoints": _two_waypoints(), "alt_frame": bad})
+
+
+def test_altitude_bounds_follow_the_datum():
+    # 500 m over the field is already beyond this airframe, but as an
+    # absolute it would refuse any field above 500 m -- so the bound has to
+    # move with the datum rather than being one fixed range.
+    high = [{"lat": 51.5, "lon": -0.12, "alt_m": 1200.0}]
+    assert _raises_value_error(
+        {"waypoints": high, "alt_frame": mission.ALT_FRAME_REL})
+    assert mission.validate(
+        {"waypoints": high, "alt_frame": mission.ALT_FRAME_AMSL})
+
+    # Below the reference is meaningless relative to the launch point and
+    # ordinary as an absolute (Schiphol, the Dead Sea).
+    below = [{"lat": 51.5, "lon": -0.12, "alt_m": -20.0}]
+    assert _raises_value_error(
+        {"waypoints": below, "alt_frame": mission.ALT_FRAME_REL})
+    assert mission.validate(
+        {"waypoints": below, "alt_frame": mission.ALT_FRAME_AMSL})
 
 
 def test_single_waypoint_still_allows_the_other_endings():
