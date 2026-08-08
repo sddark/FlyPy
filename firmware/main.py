@@ -599,6 +599,11 @@ async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux, wat
     # Forces a poll (and a home-capture attempt) on the very first pass
     # rather than _GPS_POLL_INTERVAL_MS into the flight.
     last_gps_ms = time.ticks_add(started_ms, -_GPS_POLL_INTERVAL_MS)
+    # Starts False so that arming with an already-dead link logs the entry
+    # rather than treating failsafe as the unremarkable normal state.
+    was_link_lost = False
+    lost_since_ms = started_ms
+    failsafe_events = 0
     try:
         while rc.arm_switch_on:
             watchdog.feed()
@@ -641,6 +646,22 @@ async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux, wat
             # throttle cut -- in manual too, since centered surfaces are
             # not "level wings". Treating it as a mode also resets the PIDs
             # on both entry and exit, so no stale integrator on regain.
+            # Failsafe was entirely silent, which made "the motor cuts out at
+            # part throttle" indistinguishable from an ESC or supply fault:
+            # the link drops, throttle is cut, the link returns, and nothing
+            # anywhere records that it happened. Logged on transition only,
+            # so a flapping link cannot flood the loop it is reporting on.
+            if link_lost != was_link_lost:
+                was_link_lost = link_lost
+                if link_lost:
+                    lost_since_ms = now_ms
+                    failsafe_events += 1
+                    print("FAILSAFE: link lost after %d ms silence,"
+                          " cutting throttle" % silence_ms)
+                else:
+                    print("failsafe cleared: link back after %d ms"
+                          % time.ticks_diff(now_ms, lost_since_ms))
+
             if link_lost:
                 led.set_mode("blink_fast")
                 mode = "failsafe"
@@ -776,8 +797,10 @@ async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux, wat
         total_ms = time.ticks_diff(_now_ms(), started_ms)
         if iterations and total_ms > 0:
             print(
-                "flight loop: %d iterations, ~%d Hz achieved (target %d), %d overruns"
-                % (iterations, iterations * 1000 // total_ms, FLIGHT_LOOP_HZ, overruns)
+                "flight loop: %d iterations, ~%d Hz achieved (target %d),"
+                " %d overruns, %d failsafe event(s)"
+                % (iterations, iterations * 1000 // total_ms, FLIGHT_LOOP_HZ,
+                   overruns, failsafe_events)
             )
 
 

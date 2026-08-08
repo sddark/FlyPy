@@ -42,6 +42,16 @@ class FakeUart:
         data, self._pending = self._pending, b""
         return data or None
 
+    def readinto(self, buf):
+        # Mirrors machine.UART.readinto: fills at most len(buf) bytes,
+        # returns the count, or None when nothing is pending.
+        if not self._pending:
+            return None
+        count = min(len(buf), len(self._pending))
+        buf[:count] = self._pending[:count]
+        self._pending = self._pending[count:]
+        return count
+
 
 def test_crc8_check_value():
     # Standard CRC-8/DVB-S2 check value.
@@ -196,6 +206,28 @@ def test_receiver_ignores_empty_uart():
     assert not receiver.link_alive
     assert receiver.last_frame_ms == 0
 
+
+
+class NoAllocUart(FakeUart):
+    # uart.read() allocates a fresh bytes object sized to the backlog; that
+    # single contiguous request is what failed on the board with 40 KB free.
+    # Anything reaching for it again fails loudly here instead of in flight.
+    def read(self):
+        raise AssertionError("uart.read() allocates -- use readinto()")
+
+
+def test_receiver_never_calls_the_allocating_read():
+    uart = NoAllocUart()
+    receiver = rc.CrsfReceiver(config_module.defaults(), uart=uart)
+    frame = channels_frame([992] * 16)
+    uart.queue(frame)
+    receiver.update(now_ms=0)
+    assert receiver.link_alive
+    # flush() drained with read() too, and ran right after gyro calibration
+    # with the largest backlog of the whole flight sitting in the rxbuf.
+    uart.queue(frame * 40)
+    receiver.flush()
+    receiver.update(now_ms=1)
 
 if __name__ == "__main__":
     failures = 0

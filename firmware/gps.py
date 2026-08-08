@@ -168,6 +168,13 @@ class UbxGps:
             uart = _open_uart()
         self._uart = uart
         self._parser = UbxParser()
+        # Preallocated, for the reason rc.py documents at _READ_CHUNK_BYTES:
+        # uart.read() allocates a fresh bytes object sized to the backlog on
+        # every call, and one contiguous request into a fragmented heap is
+        # what produced MemoryError on the board. 256 is well above a 100 ms
+        # poll of a 5 Hz, ~100-byte-per-fix stream.
+        self._read_buf = bytearray(256)
+        self._read_view = memoryview(self._read_buf)
         self.fix_ok = False
         self.fix_type = 0
         self.num_sv = 0
@@ -184,9 +191,10 @@ class UbxGps:
         self._last_config_ms = None
 
     def update(self, now_ms):
-        data = self._uart.read()
-        if data:
-            for msg_class, msg_id, payload in self._parser.feed(data):
+        count = self._uart.readinto(self._read_buf)
+        if count:
+            for msg_class, msg_id, payload in self._parser.feed(
+                    self._read_view[:count]):
                 is_pvt = (
                     msg_class == _CLASS_NAV
                     and msg_id == _ID_NAV_PVT

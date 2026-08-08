@@ -24,6 +24,16 @@ class FakeUart:
         data, self._pending = self._pending, b""
         return data or None
 
+    def readinto(self, buf):
+        # Mirrors machine.UART.readinto: fills at most len(buf) bytes,
+        # returns the count, or None when nothing is pending.
+        if not self._pending:
+            return None
+        count = min(len(buf), len(self._pending))
+        buf[:count] = self._pending[:count]
+        self._pending = self._pending[count:]
+        return count
+
     def write(self, data):
         self.written.append(bytes(data))
 
@@ -193,6 +203,21 @@ def test_receiver_resends_config_when_pvt_goes_silent():
     receiver.update(now_ms=6000)
     assert len(uart.written) == 2  # PVT flowing -> no further resends
 
+
+
+class NoAllocUart(FakeUart):
+    # See the matching guard in test_rc.py: read() allocates, readinto()
+    # does not, and this driver polls on the same flight loop.
+    def read(self):
+        raise AssertionError("uart.read() allocates -- use readinto()")
+
+
+def test_receiver_never_calls_the_allocating_read():
+    uart = NoAllocUart()
+    receiver = gps.UbxGps(uart=uart)
+    uart.queue(pvt_frame())
+    receiver.update(now_ms=100)
+    assert receiver.fix_ok
 
 if __name__ == "__main__":
     failures = 0

@@ -38,6 +38,18 @@ _CHANNEL_MASK = 0x7FF
 # calibration.
 _MAX_BUFFER_BYTES = 1024
 
+# Size of the preallocated UART read buffer. uart.read() allocates a NEW
+# bytes object sized to whatever is pending -- up to the full 2 KB rxbuf --
+# on every call, and that one contiguous request is what failed on the board
+# with "MemoryError allocating 2304 bytes" while 40 KB was still free.
+# readinto() reuses this buffer and allocates nothing, which takes the whole
+# failure mode off the table rather than making it less likely.
+#
+# 512 is well above a normal poll (~310 bytes at the 100 ms disarmed
+# interval, far less while armed). A backlog larger than this is simply read
+# across consecutive calls; nothing is lost, and flush() loops until empty.
+_READ_CHUNK_BYTES = 512
+
 # CRSF channel values (protocol units, not microseconds).
 _CRSF_LOW = 172
 _CRSF_CENTER = 992
@@ -173,6 +185,11 @@ class CrsfReceiver:
             uart = _open_uart()
         self._uart = uart
         self._parser = CrsfParser()
+        # Allocated once, here, and never again: see _READ_CHUNK_BYTES. Taken
+        # early for the same reason main() claims the UART buffers first --
+        # a contiguous request is cheapest before the heap is carved up.
+        self._read_buf = bytearray(_READ_CHUNK_BYTES)
+        self._read_view = memoryview(self._read_buf)
         self._channel_index = {}
         self.set_channel_map(config)
         self.channels = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0, "throttle": 0.0}
@@ -198,14 +215,18 @@ class CrsfReceiver:
         # blocking pause (gyro calibration) during which ELRS at ~6.5 KB/s
         # overran the rx buffer -- the backlog is truncated/corrupt anyway,
         # so start the flight loop clean instead of resyncing through it.
-        self._uart.read()
+        #
+        # Loops because readinto() takes at most _READ_CHUNK_BYTES a call,
+        # and the whole point of flush() is that the backlog may be larger.
+        while self._uart.readinto(self._read_buf):
+            pass
         self._parser = CrsfParser()
 
     def update(self, now_ms):
-        data = self._uart.read()
-        if not data:
+        count = self._uart.readinto(self._read_buf)
+        if not count:
             return
-        for frame_type, payload in self._parser.feed(data):
+        for frame_type, payload in self._parser.feed(self._read_view[:count]):
             is_channels = (
                 frame_type == FRAME_TYPE_RC_CHANNELS
                 and len(payload) == _RC_PAYLOAD_BYTES
