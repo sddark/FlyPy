@@ -782,6 +782,12 @@ async def main():
                                  logic_engine, free_pins)
 
     while True:
+        # Collect before building the portal, not just after tearing it down:
+        # create_app() builds a whole microdot app and its route table, and
+        # on every cycle after the first it is competing with the debris of
+        # the previous one.
+        gc.collect()
+        print("portal up, %d bytes free" % gc.mem_free())
         access_point = server.start_access_point(active_config, watchdog.feed)
         portal = _Portal(make_app)
         try:
@@ -790,6 +796,17 @@ async def main():
         finally:
             await portal.stop()
             server.stop_access_point(access_point)
+        # Drop the references BEFORE collecting, or the collect cannot
+        # actually free any of it: portal holds the microdot app, its routes
+        # and its handler closures, which together are the largest thing this
+        # firmware ever allocates after the UART buffers. Without this the
+        # heap accumulated a portal's worth of debris per arm cycle until
+        # rc.py's uart.read() could no longer find a contiguous 2 KB and the
+        # second arm of a session died with MemoryError.
+        portal = None
+        access_point = None
+        gc.collect()
+        print("armed, %d bytes free" % gc.mem_free())
         try:
             await _run_flight_loop(rc, gps, active_config, outputs, led,
                                    logic_engine, aux, watchdog)
