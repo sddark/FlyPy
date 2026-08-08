@@ -177,6 +177,7 @@ class UbxGps:
         self.ground_speed_ms = 0.0
         self.course_deg = 0.0
         self.h_acc_m = 0.0
+        self.v_acc_m = 0.0
         self.course_acc_deg = 0.0
         self.last_pvt_ms = None
         self.config_acknowledged = False
@@ -213,6 +214,7 @@ class UbxGps:
         self.ground_speed_ms = pvt["ground_speed_ms"]
         self.course_deg = pvt["course_deg"]
         self.h_acc_m = pvt["h_acc_m"]
+        self.v_acc_m = pvt["v_acc_m"]
         self.course_acc_deg = pvt["course_acc_deg"]
         self.last_pvt_ms = now_ms
 

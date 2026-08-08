@@ -90,9 +90,10 @@ _NAV_GPS_TIMEOUT_MS = 5000
 _PORTAL_RESTART_DELAY_MS = 250
 _PORTAL_MAX_FAILURES = 5
 
-# Hardware watchdog. The armed loop feeds it every iteration (250 Hz) and the
-# disarmed loop every poll (10 Hz), so it fires only if the asyncio scheduler
-# itself stops advancing -- the one failure the try/finally below cannot cover,
+# Hardware watchdog, started at the first arm (see _Watchdog for why not at
+# boot). The armed loop feeds it every iteration (250 Hz) and the disarmed
+# loop every poll (10 Hz), so it fires only if the asyncio scheduler itself
+# stops advancing -- the one failure the try/finally below cannot cover,
 # because a wedged loop never reaches a finally at all and PWM is hardware:
 # the motor would hold its last commanded throttle indefinitely. A reset lands
 # in the portal with outputs safe and, because the arm switch is still ON and
@@ -101,9 +102,11 @@ _PORTAL_MAX_FAILURES = 5
 # across a watchdog reset and keeps flying, and better than a motor stuck at
 # cruise. INAV carries no watchdog at all.
 #
-# 4 s: comfortably above the AP-start path (bounded at 5 s but run before the
-# watchdog exists) and any plausible microdot chunked send, while still
+# 4 s: comfortably above any plausible microdot chunked send, while still
 # bounding a lockup to well under the time it takes to lose sight of a plane.
+# The AP-start path is bounded at 5 s but only runs while disarmed, where on
+# the first pass the watchdog does not yet exist and on later passes the poll
+# loop it returns to is already feeding it.
 _WATCHDOG_TIMEOUT_MS = 4000
 
 # After the armed loop dies of an exception the arm switch is usually still
@@ -310,17 +313,34 @@ def _arm_requested(rc, config, now_ms):
 class _Watchdog:
     # Thin wrapper so a build without machine.WDT (or a timeout the port
     # refuses) degrades to a no-op with a printed reason rather than taking
-    # the firmware down at boot -- the portal has to come up regardless.
-    # Created once, at boot: an RP2040 watchdog cannot be stopped again, so
-    # there is no arm/disarm scoping to be had and every loop from here on
-    # has to feed it anyway.
+    # the firmware down -- the portal has to come up regardless.
+    #
+    # Started on the FIRST ARM, not at boot, and the distinction is not
+    # cosmetic. An RP2040 watchdog cannot be stopped once started, so arming
+    # it at boot meant every serial session inherited it: mpremote interrupts
+    # main.py to do its work, nothing is left feeding the timer, and 4 s
+    # later the board resets mid-operation and re-enumerates its USB. That
+    # broke deploys and every bench script in this repo, which is a tax paid
+    # on the ground for a guarantee only needed in the air.
+    #
+    # Nothing is lost by waiting. The hazard the watchdog exists for is a
+    # wedged flight loop holding the last commanded throttle, which cannot
+    # happen before the first arm. While disarmed the outputs are already
+    # safe and _Portal.check() has its own reset-to-recover path. From the
+    # first arm onward the timer stays up for the rest of the session, fed by
+    # the flight loop at 250 Hz and the disarmed poll at 10 Hz.
     def __init__(self, timeout_ms):
+        self._timeout_ms = timeout_ms
         self._wdt = None
+
+    def start(self):
+        if self._wdt is not None:
+            return
         try:
             from machine import WDT
 
-            self._wdt = WDT(timeout=timeout_ms)
-            print("watchdog armed, %d ms" % timeout_ms)
+            self._wdt = WDT(timeout=self._timeout_ms)
+            print("watchdog armed, %d ms" % self._timeout_ms)
         except (ImportError, ValueError, OSError) as error:
             print("watchdog unavailable:", repr(error))
 
@@ -487,6 +507,11 @@ async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux, wat
     # gyro calibration below take the better part of a second, so start from
     # a known-safe output state unconditionally.
     outputs.go_safe()
+    # First arm of the session brings the watchdog up; see _Watchdog. Before
+    # the IMU work below, which is the longest blocking stretch in the
+    # firmware and would otherwise be the first thing to trip it.
+    watchdog.start()
+    watchdog.feed()
     try:
         imu = MPU6050()
         imu.calibrate_gyro(sample_count=_GYRO_CALIBRATION_SAMPLES)  # plane at rest, each arm

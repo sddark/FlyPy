@@ -13,7 +13,27 @@
 # part -- server.py's page strings are the big win. lib/ (microdot) always
 # goes across as source; it is small and rarely changes.
 #
-# config.json and mission.json live on the device's flash and survive this.
+# config.json, mission.json and logic.json live on the device's flash and
+# survive this.
+#
+# TWO THINGS THIS HAS TO GET RIGHT, both learned by bricking a board:
+#
+#   1. Every module must exist on the device in exactly ONE form. Pushing
+#      .mpy without deleting the .py it replaces leaves both, and MicroPython
+#      resolves .mpy first for imports while the BOOT path takes main.py --
+#      so the board ran an old main against new modules. Each mode now
+#      deletes the other form as it goes.
+#
+#   2. MicroPython boots main.py as SOURCE. A compiled main.mpy is never
+#      executed, so the device was paying to compile ~34 KB of main.py at
+#      every boot -- and once main.py grew past roughly 33 KB that compile no
+#      longer left enough contiguous heap for `import server`, which failed
+#      with MemoryError and left the board dead with no portal. So compiled
+#      deploys put main.py's code in $STUB_TARGET.mpy and leave a three-line
+#      main.py behind to import and run it.
+#
+# config.json is deliberately never touched: the schema tolerates unknown or
+# missing keys, so a config saved by an older build still loads.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -23,6 +43,9 @@ PORT=${MPREMOTE_PORT:-/dev/ttyACM0}
 BUILD_DIR=build
 COMPILE=1
 MODULES=()
+# main.py's code lands here when compiled; main.py itself becomes the stub
+# that imports it. Must not collide with a real module name.
+STUB_TARGET=flight
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -45,16 +68,50 @@ push() {
     mpremote connect "$PORT" fs cp "$1" ":$2"
 }
 
+# Deleting a file that isn't there is the normal case on a fresh board, and
+# mpremote exits non-zero for it -- which `set -e` would turn into a failed
+# deploy.
+drop() {
+    if mpremote connect "$PORT" fs rm ":$1" >/dev/null 2>&1; then
+        echo "   (removed stale $1)"
+    fi
+}
+
 if [ "$COMPILE" -eq 1 ]; then
     mkdir -p "$BUILD_DIR"
+    deployed_main=0
     for module in "${MODULES[@]}"; do
-        mpy-cross -march="$MARCH" -O2 \
-            "firmware/$module.py" -o "$BUILD_DIR/$module.mpy"
-        push "$BUILD_DIR/$module.mpy" "$module.mpy"
+        if [ "$module" = "main" ]; then
+            # Code to $STUB_TARGET.mpy, stub to main.py. Also clear any
+            # main.mpy from a build of this script that still wrote one --
+            # harmless but dead, and confusing to find on the device.
+            mpy-cross -march="$MARCH" -O2 \
+                "firmware/main.py" -o "$BUILD_DIR/$STUB_TARGET.mpy"
+            push "$BUILD_DIR/$STUB_TARGET.mpy" "$STUB_TARGET.mpy"
+            printf 'import asyncio\nimport %s\nasyncio.run(%s.main())\n' \
+                "$STUB_TARGET" "$STUB_TARGET" > "$BUILD_DIR/main_stub.py"
+            push "$BUILD_DIR/main_stub.py" "main.py"
+            drop "main.mpy"
+            deployed_main=1
+        else
+            mpy-cross -march="$MARCH" -O2 \
+                "firmware/$module.py" -o "$BUILD_DIR/$module.mpy"
+            push "$BUILD_DIR/$module.mpy" "$module.mpy"
+            drop "$module.py"
+        fi
     done
+    if [ "$deployed_main" -eq 1 ]; then
+        echo "   (main.py is a stub; its code is in $STUB_TARGET.mpy)"
+    fi
 else
     for module in "${MODULES[@]}"; do
         push "firmware/$module.py" "$module.py"
+        drop "$module.mpy"
+        # A source deploy of main means main.py IS the program, so the
+        # compiled copy and its stub must not linger.
+        if [ "$module" = "main" ]; then
+            drop "$STUB_TARGET.mpy"
+        fi
     done
 fi
 

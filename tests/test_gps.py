@@ -114,6 +114,53 @@ def test_valset_frame_layout():
     assert len(parser.feed(frame)) == 1
 
 
+# iTOW is parsed for framing/debug only and deliberately not published.
+_NOT_PUBLISHED = ("itow_ms",)
+
+
+def test_every_parsed_field_is_published_as_an_attribute():
+    # v_acc_m was parsed correctly and then dropped between parse_nav_pvt()
+    # and _apply_pvt(), so UbxGps never grew the attribute at all. Nothing
+    # in the driver noticed, because the driver itself never reads it --
+    # main.py does, once per logic evaluation, and an AttributeError there
+    # took the whole firmware down the instant the aircraft armed with any
+    # logic rule active. Checking the published surface against the parsed
+    # one catches the next field to go the same way.
+    receiver = gps.UbxGps(uart=FakeUart())
+    fields = gps.parse_nav_pvt(make_pvt_payload())
+
+    missing = [
+        name for name in fields
+        if name not in _NOT_PUBLISHED and not hasattr(receiver, name)
+    ]
+    assert not missing, (
+        "parsed but never published, so absent until the first fix (and"
+        " after it): %s" % ", ".join(sorted(missing)))
+
+    receiver._apply_pvt(fields, 1000)
+    for name, value in fields.items():
+        if name in _NOT_PUBLISHED:
+            continue
+        assert getattr(receiver, name) == value, (
+            "%s published as %r, parsed as %r"
+            % (name, getattr(receiver, name), value))
+
+
+def test_accuracy_fields_survive_a_real_pvt():
+    # The specific field that crashed the aircraft, end to end through the
+    # UART rather than by calling _apply_pvt directly.
+    uart = FakeUart()
+    receiver = gps.UbxGps(uart=uart)
+    assert receiver.v_acc_m == 0.0, "unset before the first fix"
+    payload = bytearray(make_pvt_payload())
+    struct.pack_into("<I", payload, 40, 2500)   # hAcc 2.5 m
+    struct.pack_into("<I", payload, 44, 4100)   # vAcc 4.1 m
+    uart.queue(gps.build_frame(0x01, 0x07, bytes(payload)))
+    receiver.update(1000)
+    assert abs(receiver.h_acc_m - 2.5) < 1e-9
+    assert abs(receiver.v_acc_m - 4.1) < 1e-9
+
+
 def test_receiver_sends_config_then_applies_pvt():
     uart = FakeUart()
     receiver = gps.UbxGps(uart=uart)
