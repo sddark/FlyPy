@@ -79,6 +79,23 @@ _LOOP_PERIOD_US = 1_000_000 // FLIGHT_LOOP_HZ
 _MAX_DT_S = 0.05
 _DISARMED_POLL_MS = 100
 _GYRO_CALIBRATION_SAMPLES = 200
+# The GPS emits NAV-PVT at 5 Hz, so polling it every flight-loop iteration
+# read an empty UART almost every time -- and that turned out to cost 1942 us
+# a call, measured on the board, because draining the UART and running the
+# framing scan is not free just because it finds nothing.
+#
+# 100 ms, which is the interval gps.py already sizes its 1 KB rxbuf for, and
+# still twice the 5 Hz fix rate. It has to be longer than an iteration takes
+# or it throttles nothing: at the ~18 Hz this loop currently achieves an
+# iteration is ~55 ms, so a 50 ms interval would fire every single pass and
+# save exactly nothing. Revisit if the loop ever gets fast enough that this
+# starts costing fix latency.
+_GPS_POLL_INTERVAL_MS = 100
+# gc.mem_free() walks the entire heap: 6843 us on this board. It was being
+# called at the 25 Hz logic rate to fill one status field, which is ~17% of
+# all CPU spent on a number nothing controls on. Sample it once a second and
+# hold the value between samples.
+_MEM_FREE_INTERVAL_MS = 1000
 # Armed with the link dead this long -> throttle has been cut the whole
 # time; return to the portal rather than staying wedged in a loop only a
 # live RC frame could exit.
@@ -153,6 +170,21 @@ def _loop_gains(config):
     )
 
 
+# [value, sampled_at_ms]. A list rather than globals so the flight loop pays
+# one subscript instead of a global store; None means never sampled.
+_mem_free_sample = [0, None]
+
+
+def _sampled_mem_free(now_ms):
+    # See _MEM_FREE_INTERVAL_MS: the call itself is the expensive part, so
+    # the point is to make it rarely, not to make it cheaper.
+    if (_mem_free_sample[1] is None
+            or time.ticks_diff(now_ms, _mem_free_sample[1]) >= _MEM_FREE_INTERVAL_MS):
+        _mem_free_sample[0] = gc.mem_free()
+        _mem_free_sample[1] = now_ms
+    return _mem_free_sample[0]
+
+
 def _fill_logic_namespace(ns, rc, gps, navigator, attitude, accel_g, gyro_rad_s,
                           flight_mode, aux, compass_reading, now_ms, armed_ms,
                           dt_s, loop_hz):
@@ -222,7 +254,7 @@ def _fill_logic_namespace(ns, rc, gps, navigator, attitude, accel_g, gyro_rad_s,
     ns["uptime_ms"] = now_ms
     ns["loop_hz"] = loop_hz
     ns["dt_s"] = dt_s
-    ns["mem_free"] = gc.mem_free()
+    ns["mem_free"] = _sampled_mem_free(now_ms)
 
     for number in auxpins.ADC_PINS:
         ns["adc%d" % number] = aux.read_adc(number)
@@ -564,14 +596,23 @@ async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux, wat
     overruns = 0
     started_ms = _now_ms()
     last_us = time.ticks_us()
+    # Forces a poll (and a home-capture attempt) on the very first pass
+    # rather than _GPS_POLL_INTERVAL_MS into the flight.
+    last_gps_ms = time.ticks_add(started_ms, -_GPS_POLL_INTERVAL_MS)
     try:
         while rc.arm_switch_on:
             watchdog.feed()
             now_ms = _now_ms()
             rc.update(now_ms)
-            # Cheap at a 5 Hz fix rate: most iterations read an empty UART.
-            gps.update(now_ms)
-            _capture_home(navigator, gps, config)
+            # Polled at _GPS_POLL_INTERVAL_MS, not every iteration. This was
+            # "cheap at a 5 Hz fix rate: most iterations read an empty UART"
+            # -- an assumption the board disagreed with, at 1942 us a call.
+            # Home capture rides along because it can only change on new
+            # position data anyway.
+            if time.ticks_diff(now_ms, last_gps_ms) >= _GPS_POLL_INTERVAL_MS:
+                last_gps_ms = now_ms
+                gps.update(now_ms)
+                _capture_home(navigator, gps, config)
             led.tick(now_ms)
 
             # Measured dt: the loop sleeps a fixed remainder, so the real

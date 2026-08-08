@@ -22,6 +22,22 @@ _RC_PAYLOAD_BYTES = 22  # 16 channels x 11 bits
 _CHANNEL_COUNT = 16
 _CHANNEL_MASK = 0x7FF
 
+# Ceiling on the parser's accumulation buffer. ELRS streams ~3.1 KB/s here
+# (120 frames/s of ~26 bytes), so a 100 ms disarmed poll brings ~310 bytes
+# and an armed pass far less -- 1 KB is never reached in normal operation.
+# It is reached when the loop stalls, and then bytearray.extend() has to
+# reallocate a buffer approaching the UART's full 2 KB rxbuf. On a heap this
+# fragmented that fails: MemoryError allocating 1864 bytes with 40 KB still
+# free overall, because free memory and the largest contiguous block are not
+# the same number and MicroPython's GC never compacts.
+#
+# Discarding the oldest bytes is right rather than merely expedient. A
+# backlog this size means nothing has read the link for hundreds of
+# milliseconds, and stale stick positions have no value -- only the newest
+# frame does. It is the same reasoning flush() already uses after gyro
+# calibration.
+_MAX_BUFFER_BYTES = 1024
+
 # CRSF channel values (protocol units, not microseconds).
 _CRSF_LOW = 172
 _CRSF_CENTER = 992
@@ -92,6 +108,22 @@ class CrsfParser:
     def __init__(self):
         self._buffer = bytearray()
 
+    def _trim_for(self, incoming):
+        # Make room so buffer + incoming never exceeds _MAX_BUFFER_BYTES,
+        # dropping from the FRONT because the newest bytes are the ones worth
+        # parsing. Dropping mid-frame is fine: the scan in feed() resyncs on
+        # the next sync byte, which is what it does after any garbage.
+        buffer = self._buffer
+        overflow = len(buffer) + incoming - _MAX_BUFFER_BYTES
+        if overflow <= 0:
+            return
+        if overflow >= len(buffer):
+            # A single read big enough to blow the budget on its own; keep
+            # nothing, and feed() will take the tail of the new data.
+            self._buffer = bytearray()
+        else:
+            self._buffer = bytearray(memoryview(buffer)[overflow:])
+
     def feed(self, data):
         # Index-based scan, O(n): no `del buffer[...]` (MicroPython bytearray
         # doesn't support deletion) and no per-iteration slice copies (a
@@ -100,6 +132,14 @@ class CrsfParser:
         # RP2040). memoryview slices are zero-copy views; the only copies
         # made are each frame's payload and the final sub-frame tail.
         if data:
+            if len(data) > _MAX_BUFFER_BYTES:
+                # One read larger than the whole budget -- the UART's 2 KB
+                # rxbuf drained after a long stall. Everything but the tail
+                # is stale by definition, so nothing kept is worth keeping.
+                data = memoryview(data)[-_MAX_BUFFER_BYTES:]
+                self._buffer = bytearray()
+            else:
+                self._trim_for(len(data))
             self._buffer.extend(data)
         buffer = self._buffer
         view = memoryview(buffer)

@@ -53,6 +53,39 @@ def test_unpack_round_trip():
     assert rc.unpack_channels(pack_channels(values)) == values
 
 
+def test_oversized_read_drops_stale_frames_and_keeps_the_newest():
+    # The allocation that failed on the board was extend()ing a read
+    # approaching the UART's 2 KB rxbuf onto the buffer: one contiguous
+    # block that a fragmented heap could not supply, with 40 KB still free
+    # overall. The read is now truncated to its tail first.
+    #
+    # Asserted through behaviour rather than by measuring the buffer,
+    # because the buffer is small again by the time feed() returns either
+    # way -- the resync scan consumes unmatched garbage. What actually
+    # differs is WHICH frames survive: a frame thousands of bytes back is
+    # hundreds of milliseconds stale and must not be reported as current.
+    parser = rc.CrsfParser()
+    stale = channels_frame([rc._CRSF_LOW] * 16)
+    fresh = channels_frame([rc._CRSF_HIGH] * 16)
+    frames = parser.feed(stale + b"\x11" * 4096 + fresh)
+    assert len(frames) == 1, (
+        "expected only the newest frame, got %d" % len(frames))
+    assert rc.unpack_channels(frames[0][1])[0] == rc._CRSF_HIGH
+
+
+def test_accumulated_buffer_is_capped():
+    # The other growth path: many reads that each leave an incomplete frame
+    # behind, so the scan cannot consume them and the buffer accumulates.
+    # A truncated frame header claiming a length that never arrives is
+    # exactly what a stalled loop leaves at the tail of every read.
+    parser = rc.CrsfParser()
+    partial = bytes([rc.SYNC_ADDRESS, 60]) + b"\x11" * 10
+    for _ in range(60):
+        parser.feed(partial)
+    assert len(parser._buffer) <= rc._MAX_BUFFER_BYTES, (
+        "buffer accumulated to %d" % len(parser._buffer))
+
+
 def test_parser_handles_garbage_split_and_corruption():
     parser = rc.CrsfParser()
     good = channels_frame([992] * 16)
