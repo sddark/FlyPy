@@ -51,6 +51,7 @@ import server  # isort:skip
 
 import auxpins
 import config as config_module
+import flightlog
 import logic as logic_module
 import mission as mission_module
 import nav as nav_module
@@ -96,6 +97,24 @@ _GPS_POLL_INTERVAL_MS = 100
 # all CPU spent on a number nothing controls on. Sample it once a second and
 # hold the value between samples.
 _MEM_FREE_INTERVAL_MS = 1000
+# Iterations between scheduled collections. The loop body allocates ~1.8 KB
+# per pass -- measured on the board, and unavoidable because this build boxes
+# every float at 32 bytes (attitude.update alone accounts for 848 of it). At
+# ~53 Hz against the ~38 KB free at arm, the heap fills roughly every 21
+# iterations, so a collection fires several times a second WHEREVER the
+# allocation that triggered it happens to be. The flight log caught the
+# result: a 38-45 ms worst-case iteration against an 18 ms average.
+#
+# Collecting on a fixed cadence, immediately AFTER the servo and ESC writes,
+# does not reduce the total time spent collecting -- the scan is proportional
+# to heap size, not to garbage. What it does is move the stall out of the
+# control path, so it lands between control updates instead of delaying one.
+# That is the part felt as jitter.
+#
+# 16 keeps a comfortable margin under the ~21 the heap actually allows, so
+# the scheduled collection almost always wins the race against an unplanned
+# one, without collecting so often that the fixed scan cost dominates.
+_GC_EVERY_ITERATIONS = 16
 # Armed with the link dead this long -> throttle has been cut the whole
 # time; return to the portal rather than staying wedged in a loop only a
 # live RC frame could exit.
@@ -604,6 +623,10 @@ async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux, wat
     was_link_lost = False
     lost_since_ms = started_ms
     failsafe_events = 0
+    # Records to RAM now, writes to flash once on disarm -- so a bench test
+    # can be run with no USB attached at all. See flightlog.py.
+    recorder = flightlog.Recorder(started_ms, gc.mem_free())
+    exit_reason = "disarm"
     try:
         while rc.arm_switch_on:
             watchdog.feed()
@@ -639,6 +662,7 @@ async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux, wat
             silence_ms = time.ticks_diff(now_ms, rc.last_frame_ms)
             link_lost = not rc.link_alive or silence_ms > link_timeout_ms
             if link_lost and silence_ms > _LINK_LOST_DISARM_MS:
+                exit_reason = "link_timeout"
                 break
 
             # Failsafe behaves as a mode of its own: stabilized flight
@@ -656,9 +680,11 @@ async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux, wat
                 if link_lost:
                     lost_since_ms = now_ms
                     failsafe_events += 1
+                    recorder.note_failsafe(now_ms, silence_ms)
                     print("FAILSAFE: link lost after %d ms silence,"
                           " cutting throttle" % silence_ms)
                 else:
+                    recorder.note_failsafe_cleared(now_ms, time.ticks_diff)
                     print("failsafe cleared: link back after %d ms"
                           % time.ticks_diff(now_ms, lost_since_ms))
 
@@ -777,13 +803,36 @@ async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux, wat
             outputs.servo_right.set_normalized(right)
             outputs.esc.set_throttle(throttle)
 
+            # Deliberately HERE: the surfaces and throttle for this pass are
+            # already latched into the PWM hardware, so a collection now
+            # delays nothing that matters. Left to fire on its own it lands
+            # wherever the allocation that filled the heap happened to be --
+            # frequently mid-cascade, between reading the gyro and writing
+            # the servos. See _GC_EVERY_ITERATIONS.
+            if iterations % _GC_EVERY_ITERATIONS == 0:
+                gc.collect()
+
             iterations += 1
-            remaining_us = _LOOP_PERIOD_US - time.ticks_diff(time.ticks_us(), now_us)
+            body_us = time.ticks_diff(time.ticks_us(), now_us)
+            recorder.note_iteration(body_us)
+            recorder.note_silence(silence_ms)
+            # Cached at 1 Hz (see _MEM_FREE_INTERVAL_MS) -- the real call
+            # costs 6.8 ms and must never be made at loop rate.
+            recorder.note_free(_sampled_mem_free(now_ms))
+            remaining_us = _LOOP_PERIOD_US - body_us
             if remaining_us <= 0:
                 overruns += 1
+                recorder.note_overrun()
                 await asyncio.sleep_ms(0)
             else:
                 await asyncio.sleep_ms(remaining_us // 1000)
+    except Exception as error:
+        # Recorded before re-raising so the crash reaches the flight log.
+        # main() catches this and returns to the portal; without it landing
+        # in the record, a crash during a no-USB bench run leaves no trace
+        # at all -- which is the whole reason the log exists.
+        exit_reason = "crash: %r" % (error,)
+        raise
     finally:
         # Runs on disarm, link-loss timeout, AND any exception (e.g. a
         # transient I2C error in imu.read()): PWM is hardware, so without
@@ -802,6 +851,15 @@ async def _run_flight_loop(rc, gps, config, outputs, led, logic_engine, aux, wat
                 % (iterations, iterations * 1000 // total_ms, FLIGHT_LOOP_HZ,
                    overruns, failsafe_events)
             )
+        # After the outputs are safe and nothing is flying: the one flash
+        # write of the session. Failure to write must not mask whatever is
+        # already propagating out of the try block.
+        if iterations:
+            if flightlog.append(recorder.record(total_ms, exit_reason)):
+                print("flight log written (%d session(s) kept)"
+                      % len(flightlog.load()))
+            else:
+                print("flight log could not be written")
 
 
 async def main():

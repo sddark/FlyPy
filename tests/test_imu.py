@@ -35,6 +35,13 @@ class FakeI2C:
         assert nbytes == imu._BURST_LENGTH
         return self._burst
 
+    def readfrom_mem_into(self, address, register, buf):
+        # Mirrors machine.I2C.readfrom_mem_into: fills the caller's buffer
+        # and returns nothing, allocating no new object.
+        assert register == imu._REG_ACCEL_XOUT_H
+        assert len(buf) == imu._BURST_LENGTH
+        buf[:] = self._burst
+
 
 def test_decode_burst_scales_signed_values():
     burst = pack_burst(8192, 0, 4096, 0, 655, -655, 131)
@@ -69,6 +76,21 @@ def test_calibrate_gyro_removes_constant_bias():
     assert accel_g == (0.0, 0.0, 1.0)
     assert all(abs(component) < 1e-9 for component in gyro_rad_s)
 
+
+
+class NoAllocI2C(FakeI2C):
+    # readfrom_mem allocates a fresh bytes object per call; at flight-loop
+    # rate that is pure garbage on a heap that already fills every ~21
+    # iterations. Anything reaching for it again fails here.
+    def readfrom_mem(self, address, register, nbytes):
+        raise AssertionError("readfrom_mem allocates -- use readfrom_mem_into")
+
+
+def test_read_never_calls_the_allocating_readfrom_mem():
+    sensor = imu.MPU6050(i2c=NoAllocI2C(pack_burst(0, 0, 8192, 0, 0, 0, 0)))
+    accel_g, gyro_rad_s = sensor.read()
+    assert abs(accel_g[2] - 1.0) < 1e-6
+    assert len(gyro_rad_s) == 3
 
 if __name__ == "__main__":
     failures = 0

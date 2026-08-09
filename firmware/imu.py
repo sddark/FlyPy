@@ -71,6 +71,8 @@ class MPU6050:
             i2c = _open_i2c()
         self._i2c = i2c
         self._address = address
+        # Allocated once; see _read_burst.
+        self._burst_buf = bytearray(_BURST_LENGTH)
         self._gyro_bias_dps = (0.0, 0.0, 0.0)
         self._configure()
 
@@ -85,8 +87,13 @@ class MPU6050:
         self._write(_REG_ACCEL_CONFIG, _ACCEL_AFS_SEL_4G)
 
     def _read_burst(self):
-        data = self._i2c.readfrom_mem(self._address, _REG_ACCEL_XOUT_H, _BURST_LENGTH)
-        return decode_burst(data)
+        # readfrom_mem_into reuses the buffer allocated in __init__;
+        # readfrom_mem would allocate a fresh 14-byte object on every
+        # flight-loop iteration. Small next to the boxed floats this then
+        # produces, but it is free to avoid and this runs at loop rate.
+        self._i2c.readfrom_mem_into(
+            self._address, _REG_ACCEL_XOUT_H, self._burst_buf)
+        return decode_burst(self._burst_buf)
 
     def calibrate_gyro(self, sample_count=200, delay_ms=2):
         # Plane must be stationary. Called once at boot (see main.py); no
