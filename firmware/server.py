@@ -1493,7 +1493,30 @@ loadMission();
 _STATUS_BODY = _status_body()
 _MISSION_CHUNKS = (_MISSION_MARKUP, _MISSION_SCRIPT)
 _LOGIC_CHUNKS = (_LOGIC_MARKUP, _LOGIC_SCRIPT)
-_LOGIC_CATALOGUE = _logic_catalogue(pins.FREE_PINS)
+# Built on FIRST REQUEST, not at import. _logic_catalogue() ends in a
+# json.dumps() of the whole input/output table, which needs one contiguous
+# block of about 5 KB -- and asking for that while server.py is still being
+# imported is a boot-time allocation, made before main() has claimed the
+# UART ring buffers and with the heap at its most fragmented. It failed:
+#
+#   File "server.py", line 573, in _logic_catalogue
+#   MemoryError: memory allocation failed, allocating 5216 bytes
+#
+# and took the whole firmware down before the portal ever came up, which
+# presents as a dead board rather than as a broken page. Nothing needs this
+# until someone opens the Logic page, by which time the heap has settled and
+# the flight loop is not running. Cached after the first build, so the cost
+# is paid once per boot at worst -- and never at all on a board whose owner
+# never opens that page.
+_LOGIC_CATALOGUE = None
+
+
+def _logic_catalogue_json():
+    global _LOGIC_CATALOGUE
+
+    if _LOGIC_CATALOGUE is None:
+        _LOGIC_CATALOGUE = _logic_catalogue(pins.FREE_PINS)
+    return _LOGIC_CATALOGUE
 
 
 def _json_string(text):
@@ -1750,7 +1773,7 @@ def create_app(current_config, save_callback, rc, gps, logic_engine, free_pins):
             yield ',"rules":%d,"errors":' % len(logic_engine.rules)
             yield _json_string_list(logic_engine.errors)
             yield ',"catalogue":'
-            for piece in _chunked(_LOGIC_CATALOGUE):
+            for piece in _chunked(_logic_catalogue_json()):
                 yield piece
             yield "}"
 
